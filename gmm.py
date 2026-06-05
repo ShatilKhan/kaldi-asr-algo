@@ -101,9 +101,11 @@ class DiagGmm:
         max_log = np.max(log_weighted, axis=1, keepdims=True)
         return (np.log(np.sum(np.exp(log_weighted - max_log), axis=1)) + max_log.squeeze(1))
 
+    @staticmethod
     def score_batch_all(gmms: list, frames: np.ndarray) -> np.ndarray:
         """
-        Score a batch of frames against ALL GMMs (vectorized across GMMs).
+        Score a batch of frames against ALL GMMs (vectorized). All GMMs must
+        have the same number of components K.
 
         Args:
             gmms: list of M DiagGmm objects.
@@ -115,20 +117,16 @@ class DiagGmm:
         M = len(gmms)
         N = frames.shape[0]
         D = frames.shape[1]
-        K = gmms[0].K  # assume all have same K
+        K = gmms[0].K
 
-        # Stack all GMM parameters
         all_means = np.array([g.means for g in gmms])  # (M, K, D)
-        all_vars = np.array([g.vars for g in gmms])  # (M, K, D)
-        all_weights = np.array([g.weights for g in gmms])  # (M, K)
-        all_log_det = np.array([g._log_det for g in gmms])  # (M, K)
+        all_vars = np.array([g.vars for g in gmms])
+        all_weights = np.array([g.weights for g in gmms])
+        all_log_det = np.array([g._log_det for g in gmms])
 
-        # Score: (N, M, K, D) diff
-        diff = frames[:, None, None, :] - all_means[None, :, :, :]  # (N, M, K, D)
-        mahalanobis = np.sum(diff * diff / all_vars[None, :, :, :], axis=3)  # (N, M, K)
-        log_probs = all_log_det[None, :, :] - 0.5 * mahalanobis  # (N, M, K)
-
-        # Log-sum-exp over K components
+        diff = frames[:, None, None, :] - all_means[None, :, :, :]
+        mahalanobis = np.sum(diff * diff / all_vars[None, :, :, :], axis=3)
+        log_probs = all_log_det[None, :, :] - 0.5 * mahalanobis
         log_weighted = log_probs + np.log(all_weights)[None, :, :]
         max_log = np.max(log_weighted, axis=2, keepdims=True)
         return np.log(np.sum(np.exp(log_weighted - max_log), axis=2)) + max_log.squeeze(2)
@@ -204,6 +202,9 @@ def train_gmm(
     N, D = frames.shape
     if N == 0:
         raise ValueError("Cannot train GMM on empty frame set")
+
+    # If not enough frames for requested components, reduce components
+    n_components = min(n_components, N)
 
     # Initialize: k-means-like or random
     means = _kmeans_init(frames, n_components)

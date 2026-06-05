@@ -32,10 +32,11 @@ from lexicon import LEXICON, WORD_MAP, PHONE_MAP, NUM_PHONES, SIL_PHONE
 
 
 # Training constants
-N_ITERS_INITIAL = 3       # iterations before first split
-N_ITERS_AFTER_SPLIT = 3   # iterations per split level
+N_ITERS_INITIAL = 5       # iterations before first split
+N_ITERS_AFTER_SPLIT = 5   # iterations per split level
 N_COMPONENTS = [1, 2, 4]  # GMM component counts at each stage
-EM_ITERS = 15             # EM iterations for each training call
+EM_ITERS = 20             # EM iterations for each training call
+MIN_OCCUPANCY = 1         # minimum frames per pdf-id to update GMM
 
 
 # Map FSDD digit strings (0-9) to lexicon word names
@@ -87,21 +88,18 @@ def flat_start_initialize(
     global_mean = np.mean(all_frames, axis=0)
     global_var = np.var(all_frames, axis=0) + 1e-4
 
-    # Create GMMs for all pdf-ids with slight perturbations for diversity
-    rng = np.random.RandomState(42)
+    # Kaldi flat-start: ALL pdf-ids get the SAME GMM (global stats).
+    # Diversity comes from equal alignment pass, not from perturbed means.
+    # Each state sees different frames from the equal alignment → different GMMs
+    # after the first re-estimation.
     gmms = []
-    for p in range(num_pdfs):
-        # Perturb each GMM slightly so they're not identical
-        # This ensures Viterbi alignment can differentiate states
-        mean_perturb = rng.randn(39) * np.sqrt(global_var) * 0.1
-        var_perturb = 1.0 + rng.randn(39) * 0.05
-
+    for _ in range(num_pdfs):
         if n_components == 1:
-            means = (global_mean + mean_perturb).reshape(1, -1)
-            vars_ = (global_var * var_perturb + 1e-4).reshape(1, -1)
+            means = global_mean.reshape(1, -1)
+            vars_ = global_var.reshape(1, -1)
             weights = np.ones(1)
         else:
-            subset = all_frames[rng.choice(len(all_frames), min(1000, len(all_frames)), replace=False)]
+            subset = all_frames[np.random.choice(len(all_frames), min(1000, len(all_frames)), replace=False)]
             gmm = train_gmm(subset, n_components=n_components, n_iter=EM_ITERS)
             means, vars_, weights = gmm.means, gmm.vars, gmm.weights
 
@@ -115,6 +113,10 @@ def viterbi_align(
     phone_ids: List[int],
     phone_hmms: list,
     gmms: List[DiagGmm],
+    acoustic_scale: float = 0.1,
+    transition_scale: float = 1.0,
+    self_loop_scale: float = 0.1,
+    silence_boost: float = 1.0,
 ) -> np.ndarray:
     """
     Viterbi alignment for one utterance with known phone sequence.
@@ -122,11 +124,17 @@ def viterbi_align(
     Given the known phone sequence (from the transcript), concatenate the
     corresponding HMM topologies and find the most likely state sequence.
 
+    Matches Kaldi's gmm-align-compiled with --scale-opts options.
+
     Args:
         frames: (num_frames, D) MFCC features.
         phone_ids: list of phone IDs from build_phone_sequence().
         phone_hmms: list of all phone HMMs from build_all_phone_hmms().
         gmms: list of DiagGmm per pdf-id.
+        acoustic_scale: weight for GMM emission scores (default 0.1).
+        transition_scale: weight for transition probabilities (default 1.0).
+        self_loop_scale: weight for self-loop probabilities (default 0.1).
+        silence_boost: boost silence state scores (default 1.0 = no boost).
 
     Returns:
         (num_frames,) array of pdf-id assignments for each frame.
@@ -141,42 +149,46 @@ def viterbi_align(
     states, npdf = build_utterance_hmm(phone_ids, phone_hmms)
     num_states = len(states)
 
-    # Precompute log-likelihoods for each (frame, pdf-id) using vectorized scoring
+    # Precompute log-likelihoods
     from gmm import DiagGmm
-    log_likes = DiagGmm.score_batch_all(gmms, frames)  # (num_frames, num_pdfs)
+    log_likes = DiagGmm.score_batch_all(gmms, frames)
+
+    # Apply silence boost: multiply silence (phone_id=0) state scores by silence_boost
+    # In log space: multiply = add log(factor)
+    if silence_boost != 1.0:
+        for s_idx, state in enumerate(states):
+            # Find which phone this state belongs to by checking its pdf_id
+            phone_for_state = phone_ids[min(s_idx // 3, len(phone_ids) - 1)]
+            if phone_for_state == 0:  # SIL phone
+                pdf_id = state["pdf_id"]
+                log_likes[:, pdf_id] += np.log(silence_boost)
+
+    # Pre-compute transition log-probs with scaling
+    self_loop = np.array([s["self_loop_logp"] for s in states]) * self_loop_scale
+    forward = np.array([s["forward_logp"] for s in states]) * transition_scale
+    pdf_ids = np.array([s["pdf_id"] for s in states])
 
     # Viterbi DP on the HMM
     dp = np.full((num_frames, num_states), -1e30)
     back = np.zeros((num_frames, num_states), dtype=int)
 
     # First frame
-    pdf_0 = states[0]["pdf_id"]
-    dp[0, 0] = log_likes[0, pdf_0]
+    dp[0, 0] = log_likes[0, pdf_ids[0]] * acoustic_scale
 
-    # Pre-compute transition log-probs for vectorization
-    self_loop = np.array([s["self_loop_logp"] for s in states])
-    forward = np.array([s["forward_logp"] for s in states])
-    pdf_ids = np.array([s["pdf_id"] for s in states])
-
-    # Fill DP table (vectorized inner loop)
+    # Fill DP table
     for t in range(1, num_frames):
-        # Self-loop: from same state
-        dp_candidates = dp[t - 1] + self_loop
+        # Self-loop and forward candidates
+        dp_self = dp[t - 1] + self_loop
+        dp_forward = np.full(num_states, -1e30)
+        dp_forward[1:] = dp[t - 1, :-1] + forward[:-1]
 
-        # Forward: from previous state (state s-1)
-        forward_candidates = np.full(num_states, -1e30)
-        forward_candidates[1:] = dp[t - 1, :-1] + forward[:-1]
-
-        # Take the better of self-loop and forward
-        best = np.maximum(dp_candidates, forward_candidates)
-        back[t] = np.where(dp_candidates >= forward_candidates, np.arange(num_states), np.arange(num_states) - 1)
-        # Fix: np.where approach is tricky. Use argmax approach instead:
-        stacked = np.column_stack([dp_candidates, forward_candidates])
+        # Pick best predecessor
+        stacked = np.column_stack([dp_self, dp_forward])
         best = np.max(stacked, axis=1)
         back[t] = np.argmax(stacked, axis=1)
 
         # Add emission score
-        dp[t] = best + log_likes[t, pdf_ids]
+        dp[t] = best + log_likes[t, pdf_ids] * acoustic_scale
 
     # Traceback
     best_final = int(np.argmax(dp[-1]))
@@ -190,11 +202,55 @@ def viterbi_align(
     return align
 
 
+def equal_align(
+    frames: np.ndarray,
+    phone_ids: List[int],
+    phone_hmms: list,
+) -> np.ndarray:
+    """
+    Equal alignment pass 0 (Kaldi's align-equal).
+
+    Divides frames equally among all HMM states in the known phone sequence.
+    No GMM scores used — just uniform distribution.
+
+    This is the critical bootstrap step: it gives every state some training
+    data for the first GMM update, breaking the "all frames go to silence" trap.
+
+    Args:
+        frames: (num_frames, D) MFCC features.
+        phone_ids: list of phone IDs.
+        phone_hmms: list of all phone HMMs.
+
+    Returns:
+        (num_frames,) array of pdf-id assignments (one per frame), equally distributed.
+    """
+    num_frames = frames.shape[0]
+    if num_frames == 0:
+        return np.array([], dtype=int)
+
+    states, _ = build_utterance_hmm(phone_ids, phone_hmms)
+    num_states = len(states)
+
+    # Equal division: some get floor, some get ceil
+    base = num_frames // num_states
+    extra = num_frames % num_states
+
+    align = np.zeros(num_frames, dtype=int)
+    idx = 0
+    for s in range(num_states):
+        count = base + (1 if s < extra else 0)
+        align[idx: idx + count] = states[s]["pdf_id"]
+        idx += count
+
+    return align
+
+
 def reestimate_gmms(
     alignments: List[np.ndarray],
     frames_list: List[np.ndarray],
     old_gmms: List[DiagGmm],
     n_components: int,
+    min_occupancy: int = MIN_OCCUPANCY,
 ) -> List[DiagGmm]:
     """
     Re-estimate GMM parameters from aligned frame-to-state assignments.
@@ -222,24 +278,20 @@ def reestimate_gmms(
             if 0 <= pdf_id < num_pdfs:
                 pdf_frames[pdf_id].append(frames[t])
 
-    # Train new GMMs
+    # Train new GMMs — all must end up with the same K for vectorized scoring
     new_gmms = []
     for p in range(num_pdfs):
-        if len(pdf_frames[p]) >= n_components * 5:
+        n_frames = len(pdf_frames[p])
+        if n_frames >= min_occupancy:
             train_frames = np.array(pdf_frames[p])
-            gmm = train_gmm(train_frames, n_components=n_components, n_iter=EM_ITERS)
+            actual_comp = min(n_components, n_frames)
+            gmm = train_gmm(train_frames, n_components=actual_comp, n_iter=EM_ITERS)
         else:
-            # Not enough data: keep old GMM or create default
+            # Keep old GMM
             gmm = old_gmms[p]
-            if n_components != gmm.K:
-                # Need to adjust component count
-                if n_components > gmm.K:
-                    gmm = gmm.split()
-                    while gmm.K < n_components:
-                        gmm = gmm.split()
-                else:
-                    # Keep old for now
-                    pass
+        # Ensure component count matches n_components
+        while gmm.K < n_components:
+            gmm = gmm.split()
         new_gmms.append(gmm)
 
     return new_gmms
@@ -311,23 +363,56 @@ def train(
         if level_idx > 0:
             if verbose:
                 print(f"  Splitting from {component_levels[level_idx - 1]} to {n_comp} Gaussians")
-            # Split each GMM to reach target component count
             gmms = [gmm.split() for gmm in gmms]
 
-        for it in range(iters_per_level):
-            # Align all utterances
-            alignments = []
-            for i, (frames, phones) in enumerate(zip(frames_list, all_phone_seqs)):
-                if npdfs > 0:
-                    align = viterbi_align(frames, phones, phone_hmms, gmms)
-                    alignments.append(align)
+        # Keep previous alignment for iterations without realignment
+        prev_alignments = None
 
-            # Re-estimate
+        for it in range(iters_per_level):
+            # Determine whether to realign this iteration
+            do_align = (level_idx == 0 and it == 0)  # Pass 0: always equal-align
+            if not do_align:
+                # For all levels: realign at specific iterations
+                # Level 1 (1-GMM): realign every iteration
+                # Level 2+ (2+ GMMs): realign every other iteration
+                if level_idx == 0:
+                    do_align = True  # every iteration at level 1
+                else:
+                    do_align = (it % 2 == 0)  # every other for higher levels
+
+            if do_align:
+                alignments = []
+                if level_idx == 0 and it == 0:
+                    # Pass 0: equal alignment (Kaldi's align-equal)
+                    for frames, phones in zip(frames_list, all_phone_seqs):
+                        alignments.append(equal_align(frames, phones, phone_hmms))
+                    if verbose:
+                        print(f"  Pass 0 (equal alignment): distributing frames equally")
+                else:
+                    # Viterbi alignment with Kaldi scale factors
+                    for frames, phones in zip(frames_list, all_phone_seqs):
+                        alignments.append(viterbi_align(
+                            frames, phones, phone_hmms, gmms,
+                            acoustic_scale=1.0,
+                            transition_scale=1.0,
+                            self_loop_scale=1.0,
+                        ))
+                prev_alignments = alignments
+                realign_msg = "realign" if level_idx > 0 or it > 0 else "equal"
+            else:
+                # No realignment this iteration: reuse previous alignment
+                alignments = prev_alignments
+                realign_msg = "no realign"
+
+            if alignments is None:
+                continue
+
+            # Re-estimate GMMs from alignment
             gmms = reestimate_gmms(alignments, frames_list, gmms, n_comp)
 
             if verbose:
                 ll = compute_total_log_likelihood(frames_list, alignments, gmms)
-                print(f"  Iter {it + 1}/{iters_per_level}: log-likelihood = {ll:.1f}")
+                print(f"  Iter {it + 1}/{iters_per_level} ({realign_msg}): log-likelihood = {ll:.1f}")
 
     if verbose:
         print("\nTraining complete.")
