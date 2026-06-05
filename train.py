@@ -38,16 +38,25 @@ N_COMPONENTS = [1, 2, 4]  # GMM component counts at each stage
 EM_ITERS = 15             # EM iterations for each training call
 
 
+# Map FSDD digit strings (0-9) to lexicon word names
+_DIGIT_MAP = {
+    "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
+    "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
+}
+
+
 def build_phone_sequence(transcript: str) -> List[int]:
     """
-    Convert a transcript (e.g., "three five seven") to a flat list of phone IDs.
-    Includes silence at start and end.
+    Convert a transcript (e.g., "three five seven" or "3 5 7") to a flat
+    list of phone IDs. Includes silence at start and end.
     """
     words = transcript.strip().lower().split()
     phones = [SIL_PHONE]
     for word in words:
-        if word in LEXICON:
-            phones.extend(LEXICON[word])
+        # Map digit strings to word names (FSDD stores digits like '0', not 'zero')
+        mapped = _DIGIT_MAP.get(word, word)
+        if mapped in LEXICON:
+            phones.extend(LEXICON[mapped])
     phones.append(SIL_PHONE)
     return phones
 
@@ -78,18 +87,21 @@ def flat_start_initialize(
     global_mean = np.mean(all_frames, axis=0)
     global_var = np.var(all_frames, axis=0) + 1e-4
 
-    # Create identical GMMs for all pdf-ids
+    # Create GMMs for all pdf-ids with slight perturbations for diversity
+    rng = np.random.RandomState(42)
     gmms = []
-    for _ in range(num_pdfs):
-        # Initialize with k-means using a few random data points
-        # For flat start with 1 component, just use global stats
+    for p in range(num_pdfs):
+        # Perturb each GMM slightly so they're not identical
+        # This ensures Viterbi alignment can differentiate states
+        mean_perturb = rng.randn(39) * np.sqrt(global_var) * 0.1
+        var_perturb = 1.0 + rng.randn(39) * 0.05
+
         if n_components == 1:
-            means = global_mean.reshape(1, -1)
-            vars_ = global_var.reshape(1, -1)
+            means = (global_mean + mean_perturb).reshape(1, -1)
+            vars_ = (global_var * var_perturb + 1e-4).reshape(1, -1)
             weights = np.ones(1)
         else:
-            # Train on a subset of frames for diversity
-            subset = all_frames[np.random.choice(len(all_frames), min(1000, len(all_frames)), replace=False)]
+            subset = all_frames[rng.choice(len(all_frames), min(1000, len(all_frames)), replace=False)]
             gmm = train_gmm(subset, n_components=n_components, n_iter=EM_ITERS)
             means, vars_, weights = gmm.means, gmm.vars, gmm.weights
 

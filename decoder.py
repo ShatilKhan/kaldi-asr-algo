@@ -190,48 +190,39 @@ def decode(
         return []
 
     # --- Step 1: Score all frames against all GMMs ---
-    # scores[t][p] = log-likelihood of frame t under pdf-id p
-    scores = np.zeros((num_frames, num_pdfs))
-    for p, gmm in enumerate(gmms):
-        for t in range(num_frames):
-            scores[t, p] = gmm.log_likelihood(frames[t])
+    # Use vectorized scoring (paper Section IV-A, DecodableInterface in Section VIII)
+    from gmm import DiagGmm
+    scores = DiagGmm.score_batch_all(gmms, frames)  # (num_frames, num_pdfs)
+    acoustic_scale = 0.0833
 
     # --- Step 2: Token-passing Viterbi ---
-    # Token: (cumulative_score, history_of_olabels)
-    # We track best token per HCLG state
     tokens = {hclg.start_state: (0.0, [])}
-    best_score_at_t = 0.0
 
     for t in range(num_frames):
         new_tokens = {}
 
+        # --- Match arcs consuming this frame's GMM scores ---
         for state, (score, out_seq) in tokens.items():
             for arc in hclg.arcs[state]:
-                # GMM score contribution depends on whether this is an epsilon arc
                 if arc.ilabel == EPS:
-                    gmm_score = 0.0
+                    continue
                 elif 0 <= arc.ilabel < num_pdfs:
-                    gmm_score = -scores[t, arc.ilabel]  # negative because lower=cost
+                    gmm_score = -scores[t, arc.ilabel] * acoustic_scale
                 else:
-                    continue  # invalid pdf-id
-
+                    continue
                 new_score = score + arc.weight + gmm_score
                 new_out = out_seq + ([arc.olabel] if arc.olabel != EPS and arc.olabel < len(WORDS) else [])
-
                 if arc.next_state not in new_tokens or new_score < new_tokens[arc.next_state][0]:
                     new_tokens[arc.next_state] = (new_score, new_out)
 
-        # --- Prune (if beam is set) ---
-        if beam < float("inf") and new_tokens:
-            best_local = min(s for s, _ in new_tokens.values())
-            new_tokens = {
-                s: (sc, seq)
-                for s, (sc, seq) in new_tokens.items()
-                if sc <= best_local + beam
-            }
+        # --- Keep tokens that have frames to consume ---
+        # A token stays alive (at its current state) even if it didn't match
+        # any arc this frame. This handles epsilon-only paths and self-loops.
+        for state, (score, out_seq) in tokens.items():
+            if state not in new_tokens or score < new_tokens[state][0]:
+                new_tokens[state] = (score, out_seq)
 
-        # --- ε-closure after matching this frame ---
-        # Propagate tokens on epsilon arcs
+        # --- ε-closure: propagate along epsilon arcs ---
         changed = True
         while changed:
             changed = False
@@ -258,7 +249,7 @@ def decode(
                 best_score = final_score
                 best_seq = out_seq
 
-    # Fallback: no final state reached, take best non-final
+    # Fallback: no final state reached — take best non-final as error
     if best_score == float("inf") and tokens:
         best_state = min(tokens.keys(), key=lambda s: tokens[s][0])
         best_seq = tokens[best_state][1]

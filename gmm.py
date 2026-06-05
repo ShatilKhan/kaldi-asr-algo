@@ -84,7 +84,7 @@ class DiagGmm:
 
     def score_batch(self, frames: np.ndarray) -> np.ndarray:
         """
-        Score a batch of frames.
+        Score a batch of frames against this GMM.
 
         Args:
             frames: (N, D) array.
@@ -92,7 +92,46 @@ class DiagGmm:
         Returns:
             (N,) array of log-likelihoods.
         """
-        return np.array([self.log_likelihood(f) for f in frames])
+        # Vectorized: (N, K, D) diff, (N, K) mahalanobis, (N, K) log_probs
+        diff = frames[:, None, :] - self.means[None, :, :]  # (N, K, D)
+        mahalanobis = np.sum(diff * diff / self.vars[None, :, :], axis=2)  # (N, K)
+        log_probs = self._log_det[None, :] - 0.5 * mahalanobis  # (N, K)
+        # Log-sum-exp over components
+        log_weighted = log_probs + np.log(self.weights)[None, :]
+        max_log = np.max(log_weighted, axis=1, keepdims=True)
+        return (np.log(np.sum(np.exp(log_weighted - max_log), axis=1)) + max_log.squeeze(1))
+
+    def score_batch_all(gmms: list, frames: np.ndarray) -> np.ndarray:
+        """
+        Score a batch of frames against ALL GMMs (vectorized across GMMs).
+
+        Args:
+            gmms: list of M DiagGmm objects.
+            frames: (N, D) array.
+
+        Returns:
+            (N, M) array of log-likelihoods.
+        """
+        M = len(gmms)
+        N = frames.shape[0]
+        D = frames.shape[1]
+        K = gmms[0].K  # assume all have same K
+
+        # Stack all GMM parameters
+        all_means = np.array([g.means for g in gmms])  # (M, K, D)
+        all_vars = np.array([g.vars for g in gmms])  # (M, K, D)
+        all_weights = np.array([g.weights for g in gmms])  # (M, K)
+        all_log_det = np.array([g._log_det for g in gmms])  # (M, K)
+
+        # Score: (N, M, K, D) diff
+        diff = frames[:, None, None, :] - all_means[None, :, :, :]  # (N, M, K, D)
+        mahalanobis = np.sum(diff * diff / all_vars[None, :, :, :], axis=3)  # (N, M, K)
+        log_probs = all_log_det[None, :, :] - 0.5 * mahalanobis  # (N, M, K)
+
+        # Log-sum-exp over K components
+        log_weighted = log_probs + np.log(all_weights)[None, :, :]
+        max_log = np.max(log_weighted, axis=2, keepdims=True)
+        return np.log(np.sum(np.exp(log_weighted - max_log), axis=2)) + max_log.squeeze(2)
 
     def split(self, noise: float = 0.2) -> "DiagGmm":
         """
