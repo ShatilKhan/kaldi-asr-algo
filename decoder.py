@@ -201,6 +201,21 @@ def decode(
     for t in range(num_frames):
         new_tokens = {}
 
+        # --- ε-closure BEFORE consuming this frame ---
+        # Propagate tokens along epsilon arcs to find states with
+        # non-epsilon (pdf-id) arcs to consume this frame.
+        changed = True
+        while changed:
+            changed = False
+            for state, (score, out_seq) in list(tokens.items()):
+                for arc in hclg.arcs[state]:
+                    if arc.ilabel == EPS:
+                        new_score = score + arc.weight
+                        new_out = out_seq + ([arc.olabel] if arc.olabel != EPS and arc.olabel < len(WORDS) else [])
+                        if arc.next_state not in tokens or new_score < tokens[arc.next_state][0]:
+                            tokens[arc.next_state] = (new_score, new_out)
+                            changed = True
+
         # --- Match arcs consuming this frame's GMM scores ---
         for state, (score, out_seq) in tokens.items():
             for arc in hclg.arcs[state]:
@@ -215,14 +230,7 @@ def decode(
                 if arc.next_state not in new_tokens or new_score < new_tokens[arc.next_state][0]:
                     new_tokens[arc.next_state] = (new_score, new_out)
 
-        # --- Keep tokens that have frames to consume ---
-        # A token stays alive (at its current state) even if it didn't match
-        # any arc this frame. This handles epsilon-only paths and self-loops.
-        for state, (score, out_seq) in tokens.items():
-            if state not in new_tokens or score < new_tokens[state][0]:
-                new_tokens[state] = (score, out_seq)
-
-        # --- ε-closure: propagate along epsilon arcs ---
+        # --- ε-closure AFTER consuming this frame ---
         changed = True
         while changed:
             changed = False

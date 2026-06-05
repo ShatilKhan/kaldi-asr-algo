@@ -284,15 +284,18 @@ def reestimate_gmms(
         n_frames = len(pdf_frames[p])
         if n_frames >= min_occupancy:
             train_frames = np.array(pdf_frames[p])
-            actual_comp = min(n_components, n_frames)
-            gmm = train_gmm(train_frames, n_components=actual_comp, n_iter=EM_ITERS)
+            # Train with as many components as we have data for
+            actual_k = min(n_frames, n_components)
+            gmm = train_gmm(train_frames, n_components=actual_k, n_iter=EM_ITERS)
         else:
-            # Keep old GMM
+            # Keep old GMM at whatever K it had
             gmm = old_gmms[p]
-        # Ensure component count matches n_components
-        while gmm.K < n_components:
-            gmm = gmm.split()
         new_gmms.append(gmm)
+
+    # Step 2: ensure ALL GMMs have exactly n_components by splitting
+    for p in range(num_pdfs):
+        while new_gmms[p].K < n_components:
+            new_gmms[p] = new_gmms[p].split()
 
     return new_gmms
 
@@ -306,11 +309,19 @@ def compute_total_log_likelihood(
     Compute total log-likelihood of all training data under the current model.
     Used to track training progress.
     """
+    from gmm import DiagGmm
     total = 0.0
     for frames, align in zip(frames_list, alignments):
-        for t, pdf_id in enumerate(align):
+        # Log-likelihood of assigned frames under their GMMs
+        valid = np.array([(p >= 0 and p < len(gmms)) for p in align])
+        if not np.any(valid):
+            continue
+        pdf_ids = align[valid].astype(int)
+        # Score specific pdf-ids for specific frames using individual GMM scoring
+        for idx in np.where(valid)[0]:
+            pdf_id = align[idx]
             if 0 <= pdf_id < len(gmms):
-                total += gmms[pdf_id].log_likelihood(frames[t])
+                total += gmms[pdf_id].log_likelihood(frames[idx])
     return total
 
 

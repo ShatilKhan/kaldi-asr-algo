@@ -94,6 +94,50 @@ def load_fsdd(data_dir: str) -> List[Dict]:
     return records
 
 
+def concat_records(records: List[Dict], group_key: str = "digit") -> List[Dict]:
+    """
+    Concatenate multiple recordings of the same group into longer utterances.
+
+    This is critical for training: FSDD has ~1-second recordings which give
+    only 1-3 frames per HMM state. Concatenating 5 recordings of the same
+    digit gives 5× more frames per state, enabling proper GMM training.
+
+    Args:
+        records: list of record dicts.
+        group_key: field to group by (default "digit").
+
+    Returns:
+        List of concatenated record dicts. Each has 'text' set to the group
+        value repeated N times (e.g., "0 0 0 0 0" for 5 concatenated "0"s).
+    """
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for r in records:
+        groups[r[group_key]].append(r)
+
+    concat_records = []
+    # Concatenate in groups of CONCAT_SIZE
+    CONCAT_SIZE = 4  # 4 utterances → 4× frames → ~12 frames per state
+    for key, group in groups.items():
+        for i in range(0, len(group), CONCAT_SIZE):
+            chunk = group[i:i + CONCAT_SIZE]
+            if len(chunk) < 2:
+                # Keep single utterances too
+                concat_records.append(chunk[0])
+                continue
+            # Concatenate samples
+            all_samples = np.concatenate([r["samples"] for r in chunk])
+            all_text = " ".join([r["digit"] for r in chunk])  # e.g., "3 3 3 3"
+            # Use the first record's metadata
+            rec = dict(chunk[0])
+            rec["samples"] = all_samples
+            rec["text"] = all_text
+            rec["digit"] = key
+            concat_records.append(rec)
+
+    return concat_records
+
+
 def split_by_speaker(
     records: List[Dict], test_speakers: List[str]
 ) -> Tuple[List[Dict], List[Dict]]:
@@ -122,17 +166,24 @@ def default_test_speakers() -> List[str]:
 
 
 def prepare_dataset(
-    data_dir: str, test_speakers: List[str] = None
+    data_dir: str, test_speakers: List[str] = None, concat_training: bool = True
 ) -> Tuple[List[Dict], List[Dict]]:
     """
     Convenience: load FSDD from data_dir and split into train/test.
+
+    When concat_training is True, training recordings of the same digit are
+    concatenated into longer sequences (4 utterances per group). This
+    significantly improves GMM training by providing more frames per state.
 
     Returns (train_records, test_records).
     """
     if test_speakers is None:
         test_speakers = default_test_speakers()
     records = load_fsdd(data_dir)
-    return split_by_speaker(records, test_speakers)
+    train, test = split_by_speaker(records, test_speakers)
+    if concat_training:
+        train = concat_records(train)
+    return train, test
 
 
 if __name__ == "__main__":
