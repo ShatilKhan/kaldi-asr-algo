@@ -16,13 +16,9 @@ The decoding process:
 """
 
 import numpy as np
-from typing import List, Tuple, Optional
-from fst import FST, Arc, EPS, compose, best_path
-from hmm import build_all_phone_hmms, total_pdfs
-from lexicon import (
-    NUM_PHONES, WORDS, WORD_MAP, PHONE_IDS,
-    LEXICON, SIL_PHONE, START_WORD, END_WORD, WORD_IDS,
-)
+from typing import List
+from fst import FST, Arc, EPS, compose
+from lexicon import Lexicon
 from gmm import DiagGmm
 
 
@@ -30,12 +26,13 @@ def build_h_fst(phone_hmms: list) -> FST:
     """
     Build the H FST (HMM topology, paper Section IV-C).
 
-    H models the 3-state left-to-right HMM for each phone.
-    Input labels = pdf-ids (GMM indices).
-    Output labels = transition-ids (unique per HMM state, used for composing with C/L).
+    Input labels = pdf-ids (GMM indices). Output labels = transition-ids.
 
-    Each phone's 3 HMM states have transition-ids that are used in sequence
-    by the L FST. L reads sequences of transition-ids and maps them to words.
+    Each HMM state emits its transition-id exactly ONCE, on the arc that
+    leaves the state (forward/exit). Self-loops consume a frame but output
+    epsilon. This mirrors Kaldi's add-self-loops-after-composition design:
+    if self-loops also emitted the tid, composing with L would only accept
+    phones that last exactly 3 frames, since L expects each tid once.
 
     Args:
         phone_hmms: list of phone HMM dicts from hmm.build_all_phone_hmms()
@@ -52,13 +49,8 @@ def build_h_fst(phone_hmms: list) -> FST:
     h.set_final(loop_state)  # allow ending here too
 
     for phmm in phone_hmms:
-        pid = phmm["phone_id"]
-
         # Create 3 HMM states for this phone
-        hmm_states = []
-        for i, s in enumerate(phmm["states"]):
-            hs = h.add_state()
-            hmm_states.append(hs)
+        hmm_states = [h.add_state() for _ in phmm["states"]]
 
         # Epsilon from loop-back to first HMM state of this phone
         h.add_arc(loop_state, Arc(hmm_states[0], EPS, EPS, 0.0))
@@ -69,12 +61,12 @@ def build_h_fst(phone_hmms: list) -> FST:
         for i, s in enumerate(phmm["states"]):
             hs = hmm_states[i]
             pdf_id = s["pdf_id"]
-            tid = s["pdf_id"]  # Use pdf-id as transition-id (unique per state)
+            tid = s["pdf_id"]  # use pdf-id as transition-id (unique per state)
 
-            # Self-loop: stay in this state
-            h.add_arc(hs, Arc(hs, pdf_id, tid, -s["self_loop_logp"]))
+            # Self-loop: consume a frame, emit nothing
+            h.add_arc(hs, Arc(hs, pdf_id, EPS, -s["self_loop_logp"]))
 
-            # Forward: go to next state
+            # Leaving the state emits its tid exactly once
             if i < 2:
                 next_hs = hmm_states[i + 1]
                 h.add_arc(hs, Arc(next_hs, pdf_id, tid, -s["forward_logp"]))
@@ -85,82 +77,86 @@ def build_h_fst(phone_hmms: list) -> FST:
     return h
 
 
-def build_l_fst() -> FST:
+def build_l_fst(lex: Lexicon) -> FST:
     """
     Build the L FST (lexicon, paper Section V).
 
-    L maps transition-id sequences to words.
-    Each word is modeled as: ε:ε → tid1:ε → tid2:ε → ... → tidN:word → final
+    L maps transition-id sequences to words, as a closed loop so it accepts
+    any number of words per utterance:
 
-    H now outputs transition-ids (same as pdf-ids), and L consumes them.
-    The output is the word ID on the final arc of the phone sequence.
+        start ──(word tids, word olabel on last arc)──▶ back to start
+        start ──(SIL tids, all eps)──▶ back to start   (optional silence)
+
+    The start state is final, so the utterance can end after any word or
+    silence. Optional silence at the start, between words, and at the end
+    falls out of the loop structure for free.
     """
     l = FST()
     start = l.add_state()
     l.set_start(start)
+    l.set_final(start)
 
-    for word in WORDS:
-        word_id = WORD_MAP[word]
-        phones = LEXICON[word]
-
-        # Build transition-id sequence for this word: 3 tids per phone
-        # Each phone has 3 states with pdf-ids = phone_offset*3 + 0/1/2
-        seq = []
-        for phone_id in phones:
-            seq.extend([phone_id * 3, phone_id * 3 + 1, phone_id * 3 + 2])
-
-        # Entry state for this word
-        entry = l.add_state()
-        l.add_arc(start, Arc(entry, EPS, EPS, 0.0))
-
-        prev = entry
-        for i, tid in enumerate(seq):
-            cur = l.add_state()
-            olabel = word_id if i == len(seq) - 1 else EPS
+    def add_path(tids: List[int], olabel_last: int):
+        """Add a tid path from start back to start."""
+        prev = start
+        for i, tid in enumerate(tids):
+            last = i == len(tids) - 1
+            cur = start if last else l.add_state()
+            olabel = olabel_last if last else EPS
             l.add_arc(prev, Arc(cur, tid, olabel, 0.0))
             prev = cur
 
-        # Final state for this pronunciation
-        l.set_final(prev)
+    # Optional silence loop (epsilon output)
+    sil = lex.sil_phone
+    add_path([sil * 3, sil * 3 + 1, sil * 3 + 2], EPS)
+
+    # One loop per word; the word id comes out on the final arc
+    for word in lex.words:
+        word_id = lex.word_map[word]
+        seq = []
+        for phone_id in lex.lexicon[word]:
+            seq.extend([phone_id * 3, phone_id * 3 + 1, phone_id * 3 + 2])
+        add_path(seq, word_id)
 
     return l
 
 
-def build_g_fst(lm) -> FST:
+def build_g_fst(lm, lex: Lexicon, word_penalty: float = 0.0) -> FST:
     """
     Build the G FST (language model, paper Section VI).
 
     G encodes word-to-word transition probabilities.
     Input = word_id, Output = word_id (identity mapping).
 
-    Args:
-        lm: LanguageModel from lm.py.
-
-    Returns:
-        G FST.
+    word_penalty is a fixed extra cost per word arc (the classic word
+    insertion penalty): without it, short spurious words are nearly free
+    and the decoder happily inserts them over noisy frames.
     """
     g = FST()
     start = g.add_state()
     g.set_start(start)
+    # Empty utterance = <s> followed directly by </s>
+    g.set_final(start, -lm.bigram_prob(lex.start_word, lex.end_word))
 
-    # One state per word + start state
+    # One state per word + start state. Ending after word w costs the LM's
+    # P(</s> | w), exactly like Kaldi bakes the sentence-end probability
+    # into G's final weights.
     word_states = {}
-    for w in range(len(WORDS)):
+    for w in range(lex.num_words):
         word_states[w] = g.add_state()
-        g.set_final(word_states[w])
+        g.set_final(word_states[w], -lm.bigram_prob(w, lex.end_word))
 
-    # start -> first word (unigram)
-    for word_id in range(len(WORDS)):
-        logp = lm.bigram_prob(START_WORD, word_id)
-        w = -logp  # convert to cost
-        g.add_arc(start, Arc(word_states[word_id], word_id, word_id, w))
+    # start -> first word
+    for word_id in range(lex.num_words):
+        logp = lm.bigram_prob(lex.start_word, word_id)
+        g.add_arc(start, Arc(word_states[word_id], word_id, word_id, -logp + word_penalty))
 
     # word -> word (bigram transitions)
-    for prev_id in range(len(WORDS)):
-        for word_id in range(len(WORDS)):
+    for prev_id in range(lex.num_words):
+        for word_id in range(lex.num_words):
             logp = lm.bigram_prob(prev_id, word_id)
-            w = -logp
-            g.add_arc(word_states[prev_id], Arc(word_states[word_id], word_id, word_id, w))
+            g.add_arc(word_states[prev_id],
+                      Arc(word_states[word_id], word_id, word_id, -logp + word_penalty))
 
     return g
 
@@ -169,7 +165,8 @@ def decode(
     frames: np.ndarray,
     gmms: List[DiagGmm],
     hclg: FST,
-    beam: float = float("inf"),
+    num_words: int,
+    acoustic_scale: float = 0.0833,
 ) -> List[int]:
     """
     Decode an utterance: Viterbi token-passing on HCLG (paper Section VIII).
@@ -178,7 +175,8 @@ def decode(
         frames: (num_frames, D) MFCC feature matrix.
         gmms: list of DiagGmm, one per pdf-id.
         hclg: composed HCLG FST.
-        beam: beam width for pruning (default: no pruning).
+        num_words: vocabulary size (olabels >= num_words are not words).
+        acoustic_scale: weight on acoustic scores vs graph scores.
 
     Returns:
         List of word IDs (the hypothesized word sequence).
@@ -190,10 +188,10 @@ def decode(
         return []
 
     # --- Step 1: Score all frames against all GMMs ---
-    # Use vectorized scoring (paper Section IV-A, DecodableInterface in Section VIII)
-    from gmm import DiagGmm
     scores = DiagGmm.score_batch_all(gmms, frames)  # (num_frames, num_pdfs)
-    acoustic_scale = 0.0833
+
+    def maybe_word(olabel):
+        return [olabel] if olabel != EPS and olabel < num_words else []
 
     # --- Step 2: Token-passing Viterbi ---
     tokens = {hclg.start_state: (0.0, [])}
@@ -202,8 +200,6 @@ def decode(
         new_tokens = {}
 
         # --- ε-closure BEFORE consuming this frame ---
-        # Propagate tokens along epsilon arcs to find states with
-        # non-epsilon (pdf-id) arcs to consume this frame.
         changed = True
         while changed:
             changed = False
@@ -211,7 +207,7 @@ def decode(
                 for arc in hclg.arcs[state]:
                     if arc.ilabel == EPS:
                         new_score = score + arc.weight
-                        new_out = out_seq + ([arc.olabel] if arc.olabel != EPS and arc.olabel < len(WORDS) else [])
+                        new_out = out_seq + maybe_word(arc.olabel)
                         if arc.next_state not in tokens or new_score < tokens[arc.next_state][0]:
                             tokens[arc.next_state] = (new_score, new_out)
                             changed = True
@@ -226,7 +222,7 @@ def decode(
                 else:
                     continue
                 new_score = score + arc.weight + gmm_score
-                new_out = out_seq + ([arc.olabel] if arc.olabel != EPS and arc.olabel < len(WORDS) else [])
+                new_out = out_seq + maybe_word(arc.olabel)
                 if arc.next_state not in new_tokens or new_score < new_tokens[arc.next_state][0]:
                     new_tokens[arc.next_state] = (new_score, new_out)
 
@@ -238,7 +234,7 @@ def decode(
                 for arc in hclg.arcs[state]:
                     if arc.ilabel == EPS:
                         new_score = score + arc.weight
-                        new_out = out_seq + ([arc.olabel] if arc.olabel != EPS and arc.olabel < len(WORDS) else [])
+                        new_out = out_seq + maybe_word(arc.olabel)
                         if arc.next_state not in new_tokens or new_score < new_tokens[arc.next_state][0]:
                             new_tokens[arc.next_state] = (new_score, new_out)
                             changed = True
@@ -265,29 +261,20 @@ def decode(
     return best_seq
 
 
-def assemble_hclg(phone_hmms: list, lm) -> FST:
+def assemble_hclg(phone_hmms: list, lm, lex: Lexicon, word_penalty: float = 0.0) -> FST:
     """
     Build the full HCLG = H ∘ L ∘ G decoder graph (paper Section VII).
-
-    Args:
-        phone_hmms: list of phone HMM dicts.
-        lm: LanguageModel from lm.py.
-
-    Returns:
-        Composed HCLG FST.
     """
-    from fst import compose
-
     print("  Building H FST...")
     h = build_h_fst(phone_hmms)
     print(f"    H: {h.print_stats()}")
 
     print("  Building L FST...")
-    l = build_l_fst()
+    l = build_l_fst(lex)
     print(f"    L: {l.print_stats()}")
 
     print("  Building G FST...")
-    g = build_g_fst(lm)
+    g = build_g_fst(lm, lex, word_penalty=word_penalty)
     print(f"    G: {g.print_stats()}")
 
     print("  Composing H ∘ L...")
@@ -302,39 +289,16 @@ def assemble_hclg(phone_hmms: list, lm) -> FST:
 
 
 if __name__ == "__main__":
-    from lexicon import WORDS, LEXICON, PHONE_IDS
+    from lexicon import YESNO
     from lm import train_lm
+    from hmm import build_all_phone_hmms, total_pdfs
 
-    # Build phone HMMs
-    num_phones = 22  # from lexicon
-    phone_hmms = build_all_phone_hmms(num_phones)
-    npdfs = total_pdfs(phone_hmms)
-    print(f"Phone HMMs: {len(phone_hmms)} phones, {npdfs} pdf-ids")
+    lex = YESNO
+    phone_hmms = build_all_phone_hmms(lex.num_phones)
+    print(f"Phone HMMs: {len(phone_hmms)} phones, {total_pdfs(phone_hmms)} pdf-ids")
 
-    # Train a simple LM
-    sample_transcripts = [
-        "zero one two three four five six seven eight nine",
-        "one two three four five six seven eight nine zero",
-        "two three four five six seven eight nine zero one",
-    ]
-    lm = train_lm(sample_transcripts)
+    lm = train_lm(["yes no yes yes no", "no no yes no"], lex)
     print(f"LM: {lm}")
 
-    # Test H FST
-    h = build_h_fst(phone_hmms)
-    print(f"\nH FST: {h.print_stats()}")
-
-    # Test L FST
-    l = build_l_fst()
-    print(f"L FST: {l.print_stats()}")
-
-    # Test G FST
-    g = build_g_fst(lm)
-    print(f"G FST: {g.print_stats()}")
-
-    # Compose and test
-    print("\n--- Composing HCLG ---")
-    hclg = assemble_hclg(phone_hmms, lm)
-
-    # Check HCLG sanity
+    hclg = assemble_hclg(phone_hmms, lm, lex)
     print(f"\nComposed HCLG: {hclg.print_stats()}")
