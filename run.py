@@ -70,6 +70,26 @@ def load_commands():
     return train_data, test_data, SPEECH_COMMANDS
 
 
+def load_an4():
+    """AN4: connected small-vocab read speech, real speaker-disjoint splits."""
+    from data.an4 import load_an4 as _load_an4, load_audio, load_an4_dict
+    from lexicon import Lexicon
+
+    lex = Lexicon.from_prons(load_an4_dict())
+    train_recs = _load_an4("train")
+    test_recs = _load_an4("test")
+
+    def to_data(rs):
+        out = []
+        for r in rs:
+            samples, sr = load_audio(r)
+            out.append((r["text"], samples, sr))
+        return out
+
+    print(f"  AN4: vocab={lex.num_words} words, {len(train_recs)} train / {len(test_recs)} test (speaker-disjoint)")
+    return to_data(train_recs), to_data(test_recs), lex
+
+
 def load_libri(max_words=16, lexicon_path="data/librispeech/librispeech-lexicon.txt"):
     """
     Mini LibriSpeech continuous ASR on a small closed vocabulary.
@@ -133,6 +153,12 @@ TASKS = {
         "loader": load_libri, "lexicon": None, "sil_between": True,
         "trim": True, "word_penalty": 0.0, "acoustic_scale": 0.0833,
         "component_levels": [1, 2, 4], "g_mode": "unigram", "beam": 12.0,
+    },
+    "an4": {
+        "loader": load_an4, "lexicon": None, "sil_between": True,
+        "trim": True, "word_penalty": 0.0, "acoustic_scale": 0.0833,
+        "component_levels": [1, 2, 4], "g_mode": "wordloop", "beam": 12.0,
+        "lm_otf": True,
     },
 }
 
@@ -206,9 +232,11 @@ def main():
     refs_list = []
     hyps_list = []
 
+    decode_lm = lm if task.get("lm_otf") else None
     for i, (frames, ref_text) in enumerate(zip(test_frames, test_transcripts)):
         word_ids = decode(frames, gmms, hclg, lex.num_words,
-                          acoustic_scale=task["acoustic_scale"], beam=task["beam"])
+                          acoustic_scale=task["acoustic_scale"], beam=task["beam"],
+                          lm=decode_lm)
         hyp_words = [lex.word_ids[wid] for wid in word_ids if wid in lex.word_ids]
         ref_words = ref_text.split()
 

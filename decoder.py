@@ -15,6 +15,8 @@ The decoding process:
      c. Extract word sequence from best path
 """
 
+from collections import deque
+
 import numpy as np
 from typing import List
 from fst import FST, Arc, EPS, compose
@@ -170,22 +172,28 @@ def _prune(tokens: dict, beam: float) -> dict:
     return {st: v for st, v in tokens.items() if v[0] <= cutoff}
 
 
-def build_unigram_g(lm, lex: Lexicon, word_penalty: float = 0.0) -> FST:
+def build_unigram_g(lm, lex: Lexicon, word_penalty: float = 0.0,
+                    include_lm: bool = True) -> FST:
     """
-    Build a single-state unigram G.
+    Build a single-state word-loop G.
 
     For isolated-word tasks a bigram adds no context (one word per utterance)
     but its V states multiply the H∘L state count during composition (the
     epsilon filter copies every H∘L state per G state), blowing HCLG up by V×.
-    A one-state unigram keeps HCLG ≈ H∘L. Proper large-vocab continuous ASR
-    instead needs a determinized backoff bigram (Phase 2b).
+    A one-state loop keeps HCLG ≈ H∘L.
+
+    include_lm=True bakes the unigram log-prob into each word arc. With
+    include_lm=False the arc carries only the word penalty, and the language
+    model is applied on the fly in the decoder (so a bigram can be used
+    without the V× determinization blowup of a multi-state G).
     """
     g = FST()
     s = g.add_state()
     g.set_start(s)
     g.set_final(s, 0.0)
     for w in range(lex.num_words):
-        g.add_arc(s, Arc(s, w, w, -lm.unigram_prob(w) + word_penalty))
+        weight = word_penalty + (-lm.unigram_prob(w) if include_lm else 0.0)
+        g.add_arc(s, Arc(s, w, w, weight))
     return g
 
 
@@ -196,9 +204,13 @@ def decode(
     num_words: int,
     acoustic_scale: float = 0.0833,
     beam: float = float("inf"),
+    lm=None,
 ) -> List[int]:
     """
     Decode an utterance: Viterbi token-passing on HCLG (paper Section VIII).
+
+    Fast token passing: a worklist epsilon-closure (no O(n^2) re-scan) and
+    backpointers (no per-token list copies).
 
     Args:
         frames: (num_frames, D) MFCC feature matrix.
@@ -207,89 +219,117 @@ def decode(
         num_words: vocabulary size (olabels >= num_words are not words).
         acoustic_scale: weight on acoustic scores vs graph scores.
         beam: prune tokens with cost > best + beam each frame (inf = no prune).
-              Required to keep large-vocabulary HCLG search tractable.
+        lm: if given, apply its bigram cost on the fly when a word is emitted,
+            keying tokens by (state, last_word). Lets a compact unigram-shaped
+            graph carry real bigram context. None = use the graph weights as-is.
 
     Returns:
         List of word IDs (the hypothesized word sequence).
     """
     num_frames = frames.shape[0]
     num_pdfs = len(gmms)
-
     if num_frames == 0 or num_pdfs == 0:
         return []
 
-    # --- Step 1: Score all frames against all GMMs ---
     scores = DiagGmm.score_batch_all(gmms, frames)  # (num_frames, num_pdfs)
+    arcs = hclg.arcs
+    use_lm = lm is not None
+    start_word = lm.start_word if use_lm else -1
+    end_word = lm.end_word if use_lm else -1
 
-    def maybe_word(olabel):
-        return [olabel] if olabel != EPS and olabel < num_words else []
+    # Backpointers: a new entry is created only when a word is emitted, so the
+    # table stays small. bp index -1 is the root (empty history).
+    bp_prev = []
+    bp_word = []
 
-    # --- Step 2: Token-passing Viterbi ---
-    tokens = {hclg.start_state: (0.0, [])}
+    def emit_bp(prev_bp, word):
+        bp_prev.append(prev_bp)
+        bp_word.append(word)
+        return len(bp_prev) - 1
+
+    def state_of(key):
+        return key[0] if use_lm else key
+
+    def lastword_of(key):
+        return key[1] if use_lm else None
+
+    def close(tokens):
+        """Relax all epsilon-input arcs to a fixed point via a worklist."""
+        work = deque(tokens.keys())
+        while work:
+            key = work.popleft()
+            cost, bp = tokens[key]
+            st, lw = state_of(key), lastword_of(key)
+            for arc in arcs[st]:
+                if arc.ilabel != EPS:
+                    continue
+                w = arc.olabel if (arc.olabel != EPS and arc.olabel < num_words) else None
+                ncost = cost + arc.weight
+                nlw, nbp = lw, bp
+                if w is not None:
+                    if use_lm:
+                        ncost += -lm.bigram_prob(lw, w)
+                        nlw = w
+                    nbp = emit_bp(bp, w)
+                nkey = (arc.next_state, nlw) if use_lm else arc.next_state
+                if nkey not in tokens or ncost < tokens[nkey][0]:
+                    tokens[nkey] = (ncost, nbp)
+                    work.append(nkey)
+        return tokens
+
+    start_key = (hclg.start_state, start_word) if use_lm else hclg.start_state
+    tokens = close({start_key: (0.0, -1)})
 
     for t in range(num_frames):
+        row = scores[t]
         new_tokens = {}
-
-        # --- ε-closure BEFORE consuming this frame ---
-        changed = True
-        while changed:
-            changed = False
-            for state, (score, out_seq) in list(tokens.items()):
-                for arc in hclg.arcs[state]:
-                    if arc.ilabel == EPS:
-                        new_score = score + arc.weight
-                        new_out = out_seq + maybe_word(arc.olabel)
-                        if arc.next_state not in tokens or new_score < tokens[arc.next_state][0]:
-                            tokens[arc.next_state] = (new_score, new_out)
-                            changed = True
-
-        # --- Match arcs consuming this frame's GMM scores ---
-        for state, (score, out_seq) in tokens.items():
-            for arc in hclg.arcs[state]:
-                if arc.ilabel == EPS:
+        for key, (cost, bp) in tokens.items():
+            st, lw = state_of(key), lastword_of(key)
+            for arc in arcs[st]:
+                il = arc.ilabel
+                if not (0 <= il < num_pdfs):
                     continue
-                elif 0 <= arc.ilabel < num_pdfs:
-                    gmm_score = -scores[t, arc.ilabel] * acoustic_scale
-                else:
-                    continue
-                new_score = score + arc.weight + gmm_score
-                new_out = out_seq + maybe_word(arc.olabel)
-                if arc.next_state not in new_tokens or new_score < new_tokens[arc.next_state][0]:
-                    new_tokens[arc.next_state] = (new_score, new_out)
+                ncost = cost + arc.weight - row[il] * acoustic_scale
+                w = arc.olabel if (arc.olabel != EPS and arc.olabel < num_words) else None
+                nlw, nbp = lw, bp
+                if w is not None:
+                    if use_lm:
+                        ncost += -lm.bigram_prob(lw, w)
+                        nlw = w
+                    nbp = emit_bp(bp, w)
+                nkey = (arc.next_state, nlw) if use_lm else arc.next_state
+                cur = new_tokens.get(nkey)
+                if cur is None or ncost < cur[0]:
+                    new_tokens[nkey] = (ncost, nbp)
 
-        # --- ε-closure AFTER consuming this frame ---
-        changed = True
-        while changed:
-            changed = False
-            for state, (score, out_seq) in list(new_tokens.items()):
-                for arc in hclg.arcs[state]:
-                    if arc.ilabel == EPS:
-                        new_score = score + arc.weight
-                        new_out = out_seq + maybe_word(arc.olabel)
-                        if arc.next_state not in new_tokens or new_score < new_tokens[arc.next_state][0]:
-                            new_tokens[arc.next_state] = (new_score, new_out)
-                            changed = True
-
-        tokens = _prune(new_tokens, beam)
+        tokens = _prune(close(new_tokens), beam)
         if not tokens:
             return []
 
-    # --- Step 3: Pick best final path ---
-    best_score = float("inf")
-    best_seq = []
-    for state, (score, out_seq) in tokens.items():
-        if state in hclg.final_states:
-            final_score = score + hclg.final_weights.get(state, 0.0)
-            if final_score < best_score:
-                best_score = final_score
-                best_seq = out_seq
+    # --- Pick best final path ---
+    best_cost = float("inf")
+    best_bp = -1
+    for key, (cost, bp) in tokens.items():
+        st = state_of(key)
+        if st in hclg.final_states:
+            fc = cost + hclg.final_weights.get(st, 0.0)
+            if use_lm:
+                fc += -lm.bigram_prob(lastword_of(key), end_word)
+            if fc < best_cost:
+                best_cost, best_bp = fc, bp
 
-    # Fallback: no final state reached — take best non-final as error
-    if best_score == float("inf") and tokens:
-        best_state = min(tokens.keys(), key=lambda s: tokens[s][0])
-        best_seq = tokens[best_state][1]
+    if best_cost == float("inf") and tokens:  # no final reached: best effort
+        key = min(tokens, key=lambda k: tokens[k][0])
+        best_bp = tokens[key][1]
 
-    return best_seq
+    # Reconstruct the word sequence from backpointers.
+    words = []
+    i = best_bp
+    while i != -1:
+        words.append(bp_word[i])
+        i = bp_prev[i]
+    words.reverse()
+    return words
 
 
 def assemble_hclg(phone_hmms: list, lm, lex: Lexicon,
@@ -310,7 +350,11 @@ def assemble_hclg(phone_hmms: list, lm, lex: Lexicon,
     print(f"    L: {l.print_stats()}")
 
     print(f"  Building G FST ({g_mode})...")
-    if g_mode == "unigram":
+    if g_mode == "wordloop":
+        # Penalty-only word loop; the LM is applied on the fly in the decoder
+        # (lets a bigram run without the V× determinization blowup).
+        g = build_unigram_g(lm, lex, word_penalty=word_penalty, include_lm=False)
+    elif g_mode == "unigram":
         g = build_unigram_g(lm, lex, word_penalty=word_penalty)
     else:
         g = build_g_fst(lm, lex, word_penalty=word_penalty)
