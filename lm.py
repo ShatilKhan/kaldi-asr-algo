@@ -1,5 +1,5 @@
 """
-Language model for digit recognition (paper Section VI).
+Language model (paper Section VI).
 
 Simple n-gram model built from training transcripts.
 Used to build the G FST for HCLG composition.
@@ -12,9 +12,9 @@ as negative log probabilities (costs) for integration with the WFST decoder.
 """
 
 import math
-from typing import Dict, Tuple, Optional
-import numpy as np
-from lexicon import WORDS, WORD_MAP, START_WORD, END_WORD, NUM_WORDS
+from typing import Dict, Tuple
+
+from lexicon import Lexicon
 
 
 class LanguageModel:
@@ -26,10 +26,15 @@ class LanguageModel:
         bigrams: dict[(prev_id, word_id)] -> log_prob
         backoff: dict[prev_id] -> backoff_weight (log)
         order: 1 for unigram, 2 for bigram
+        num_words, start_word, end_word: vocabulary layout from the Lexicon
     """
 
-    def __init__(self, order: int = 2):
+    def __init__(self, order: int = 2, num_words: int = 0,
+                 start_word: int = 0, end_word: int = 0):
         self.order = order
+        self.num_words = num_words
+        self.start_word = start_word
+        self.end_word = end_word
         self.unigrams: Dict[int, float] = {}
         self.bigrams: Dict[Tuple[int, int], float] = {}
         self.backoff: Dict[int, float] = {}
@@ -55,14 +60,14 @@ class LanguageModel:
 
     def sentence_log_prob(self, word_ids: list) -> float:
         """Compute log-probability of a full sentence (with <s> and </s>)."""
-        ids = [START_WORD] + word_ids + [END_WORD]
+        ids = [self.start_word] + word_ids + [self.end_word]
         logp = 0.0
         for i in range(1, len(ids)):
             logp += self.score(ids[i - 1], ids[i])
         return logp
 
     def perplexity(self, word_ids: list) -> float:
-        """Compute perplexity of a sentence: 2^(-avg log_prob per word)."""
+        """Compute perplexity of a sentence: exp(-avg log_prob per word)."""
         logp = self.sentence_log_prob(word_ids)
         # Number of word predictions = len(word_ids) + 1 (the final </s>)
         n = len(word_ids) + 1
@@ -77,6 +82,7 @@ class LanguageModel:
 
 def train_lm(
     transcripts: list,
+    lex: Lexicon,
     order: int = 2,
     add_k: float = 1.0,
 ) -> LanguageModel:
@@ -87,29 +93,26 @@ def train_lm(
 
     Args:
         transcripts: list of strings, each a sentence like "three five seven"
+        lex: the task Lexicon (provides word ids and sentence markers)
         order: 1 (unigram) or 2 (bigram)
         add_k: smoothing constant for add-k smoothing
 
     Returns:
         LanguageModel with log-probabilities.
     """
-    lm = LanguageModel(order=order)
+    lm = LanguageModel(order=order, num_words=lex.num_words,
+                       start_word=lex.start_word, end_word=lex.end_word)
 
     # Count occurrences
     unigram_counts: Dict[int, float] = {}
     bigram_counts: Dict[Tuple[int, int], float] = {}
-    start_counts: Dict[int, float] = {}  # words at sentence start
 
     for trans in transcripts:
         words = trans.strip().lower().split()
-        word_ids = [WORD_MAP[w] for w in words if w in WORD_MAP]
+        word_ids = [lex.word_map[w] for w in words if w in lex.word_map]
 
-        # <s> first_word_id
-        if word_ids:
-            start_counts[word_ids[0]] = start_counts.get(word_ids[0], 0) + 1
-
-        # Count unigrams and bigrams
-        all_ids = [START_WORD] + word_ids + [END_WORD]
+        # Count unigrams and bigrams over <s> w1 ... wN </s>
+        all_ids = [lex.start_word] + word_ids + [lex.end_word]
         for w in all_ids:
             unigram_counts[w] = unigram_counts.get(w, 0) + 1
         for i in range(1, len(all_ids)):
@@ -120,25 +123,24 @@ def train_lm(
     total_unigrams = sum(unigram_counts.values())
 
     # Compute unigram probabilities (with smoothing)
-    vocab_size = NUM_WORDS + 2  # words + <s> + </s>
-    for w in range(NUM_WORDS + 2):
+    vocab_size = lex.num_words + 2  # words + <s> + </s>
+    for w in range(vocab_size):
         cnt = unigram_counts.get(w, 0)
         lm.unigrams[w] = math.log((cnt + add_k) / (total_unigrams + add_k * vocab_size))
 
     # Compute bigram probabilities (with smoothing)
     if order >= 2:
-        for prev_id in range(NUM_WORDS + 2):
+        for prev_id in range(vocab_size):
             prev_count = unigram_counts.get(prev_id, 0)
             lm.backoff[prev_id] = math.log(
                 prev_count / (prev_count + add_k * vocab_size)
                 if prev_count > 0
                 else 1.0
             )
-            for word_id in range(NUM_WORDS + 2):
-                cnt_prev_word = prev_count
+            for word_id in range(vocab_size):
                 cnt = bigram_counts.get((prev_id, word_id), 0)
-                if cnt_prev_word > 0:
-                    prob = (cnt + add_k) / (cnt_prev_word + add_k * vocab_size)
+                if prev_count > 0:
+                    prob = (cnt + add_k) / (prev_count + add_k * vocab_size)
                 else:
                     prob = 1.0 / vocab_size
                 lm.bigrams[(prev_id, word_id)] = math.log(prob)
@@ -146,88 +148,21 @@ def train_lm(
     return lm
 
 
-def build_g_fst(lm: LanguageModel) -> "FST":
-    """
-    Build the G WFST from a trained language model.
-
-    The G FST encodes word-level transition probabilities.
-    Input = output = word_id (identity mapping on each arc).
-    Weight = negative log probability from the LM.
-
-    Returns:
-        FST for G, ready to be composed with L.
-    """
-    from fst import FST, Arc, EPS
-
-    fst = FST()
-
-    # One state per context word (plus start state)
-    # State 0 = start (<s> context), state 1...N = word-specific states
-    # Actually simpler: one big state per unique word context
-    # For bigram, we need states for each possible previous word
-
-    # Start state
-    start = fst.add_state()
-    fst.set_start(start)
-
-    # We'll create a state per word for the bigram context
-    # State for each word + start + end
-    word_states = {}
-    for w in range(NUM_WORDS):
-        word_states[w] = fst.add_state()
-        fst.set_final(word_states[w])  # allow ending at any word
-
-    # Add arcs for start -> first word
-    for word_id in range(NUM_WORDS):
-        logp = lm.bigram_prob(START_WORD, word_id)
-        fst.add_arc(start, Arc(word_states[word_id], word_id, word_id, -logp))
-
-    # Add arcs for word -> word transitions
-    for prev_id in range(NUM_WORDS):
-        for word_id in range(NUM_WORDS):
-            logp = lm.bigram_prob(prev_id, word_id)
-            fst.add_arc(
-                word_states[prev_id],
-                Arc(word_states[word_id], word_id, word_id, -logp),
-            )
-
-    # Add arcs to end (sentence end)
-    for prev_id in range(NUM_WORDS):
-        logp = lm.bigram_prob(prev_id, END_WORD)
-        fst.add_arc(
-            word_states[prev_id],
-            Arc(fst.add_state(), END_WORD, END_WORD, -logp),
-        )
-
-    # Set the last state as final
-    final_state = fst.num_states - 1
-    fst.set_final(final_state)
-
-    return fst
-
-
 if __name__ == "__main__":
-    # Test LM with sample transcripts
+    from lexicon import DIGITS
+
     sample = ["one two three", "zero one two", "three four five", "six seven eight", "nine zero one"]
-    lm = train_lm(sample)
+    lm = train_lm(sample, DIGITS)
     print(f"Trained {lm}")
 
-    # Test probabilities
-    for w in WORDS:
-        wid = WORD_MAP[w]
+    for w in DIGITS.words:
+        wid = DIGITS.word_map[w]
         print(f"  P({w}) = {math.exp(lm.unigram_prob(wid)):.4f}")
 
-    # Test bigram
-    p1_wid = WORD_MAP["one"]
-    p2_wid = WORD_MAP["two"]
-    bp = lm.bigram_prob(p1_wid, p2_wid)
+    p1 = DIGITS.word_map["one"]
+    p2 = DIGITS.word_map["two"]
+    bp = lm.bigram_prob(p1, p2)
     print(f"\n  P(two | one) = {math.exp(bp):.4f} (log = {bp:.4f})")
 
-    # Test perplexity
-    test = [WORD_MAP[w] for w in "three four five".split()]
-    pp = lm.perplexity(test)
-    print(f"\n  Perplexity of 'three four five': {pp:.2f}")
-
-    # Build G FST
-    g = build_g_fst(lm)
-    print(f"\n  G FST: {g.print_stats()}")
+    test = [DIGITS.word_map[w] for w in "three four five".split()]
+    print(f"\n  Perplexity of 'three four five': {lm.perplexity(test):.2f}")

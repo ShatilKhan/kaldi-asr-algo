@@ -1,111 +1,103 @@
 """
-Pronunciation dictionary (lexicon) for English digits (paper Section V-L).
+Pronunciation lexicons (paper Section V-L).
 
-Maps words to phone sequences. Used to build the L FST for HCLG composition.
-
-Phone set covers the sounds needed for digits 0–9 and silence.
+A Lexicon bundles the phone set and the word -> phone-sequence dictionary
+for one recognition task. The decoder and trainer take a Lexicon instance,
+so the same pipeline runs on different datasets (digits, yesno, ...).
 """
 
-# Phone set for English digits
-# Each phone gets a unique integer ID.
-PHONE_MAP = {
-    # Silence
+from typing import Dict, List
+
+
+class Lexicon:
+    """Phone set + pronunciation dictionary for one task."""
+
+    def __init__(self, phone_map: Dict[str, int], prons: Dict[str, List[str]], sil: str = "SIL"):
+        """
+        Args:
+            phone_map: phone symbol -> phone id (must include `sil`).
+            prons: word -> list of phone symbols.
+            sil: name of the silence phone.
+        """
+        self.phone_map = dict(phone_map)
+        self.phone_ids = {v: k for k, v in self.phone_map.items()}
+        self.num_phones = len(self.phone_map)
+        self.sil_phone = self.phone_map[sil]
+
+        # word -> list of phone ids
+        self.lexicon: Dict[str, List[int]] = {
+            word: [self.phone_map[p] for p in phones] for word, phones in prons.items()
+        }
+
+        self.words = sorted(self.lexicon.keys())
+        self.word_map = {w: i for i, w in enumerate(self.words)}
+        self.word_ids = {i: w for w, i in self.word_map.items()}
+        self.num_words = len(self.words)
+
+        # LM sentence markers sit just past the real word ids
+        self.start_word = self.num_words      # <s>
+        self.end_word = self.num_words + 1    # </s>
+
+    def phones_for(self, word: str) -> List[int]:
+        return self.lexicon[word]
+
+    def __repr__(self) -> str:
+        return f"Lexicon({self.num_words} words, {self.num_phones} phones)"
+
+
+# ---------------------------------------------------------------------------
+# Task: English digits (FSDD)
+# ---------------------------------------------------------------------------
+
+_DIGIT_PHONES = {
     "SIL": 0,
-    # Vowels
-    "Z": 1,   # z (zero)
-    "IY": 2,  # ee (zero, three)
-    "R": 3,   # r (zero, three, four)
-    "OW": 4,  # oh (zero, four)
-    "W": 5,   # w (one)
-    "AH": 6,  # uh (one)
-    "N": 7,   # n (one, nine, seven)
-    "T": 8,   # t (two)
-    "UW": 9,  # oo (two)
-    "TH": 10, # th (three)
-    "F": 11,  # f (four, five)
-    "AO": 12, # aw (four)
-    "AY": 13, # eye (five, nine)
-    "V": 14,  # v (five, seven)
-    "S": 15,  # s (six, seven)
-    "IH": 16, # ih (six)
-    "K": 17,  # k (six)
-    "EH": 18, # eh (seven)
-    "EY": 19, # ay (eight)
-    "AYT": 20,# eight / ended t
-    "AYN": 21,# nine / ended n
+    "Z": 1, "IY": 2, "R": 3, "OW": 4, "W": 5, "AH": 6, "N": 7,
+    "T": 8, "UW": 9, "TH": 10, "F": 11, "AO": 12, "AY": 13, "V": 14,
+    "S": 15, "IH": 16, "K": 17, "EH": 18, "EY": 19, "AYT": 20, "AYN": 21,
 }
 
-# Inverse mapping: phone_id → phone_symbol
-PHONE_IDS = {v: k for k, v in PHONE_MAP.items()}
-
-# Number of phones
-NUM_PHONES = len(PHONE_MAP)
-
-# Silence phone ID
-SIL_PHONE = PHONE_MAP["SIL"]
-
-# Pronunciation dictionary: word → list of phone IDs
-# Using a simple phonemic transcription for each digit.
-LEXICON = {
-    "zero":    [PHONE_MAP["Z"], PHONE_MAP["IY"], PHONE_MAP["R"], PHONE_MAP["OW"]],
-    "one":     [PHONE_MAP["W"], PHONE_MAP["AH"], PHONE_MAP["N"]],
-    "two":     [PHONE_MAP["T"], PHONE_MAP["UW"]],
-    "three":   [PHONE_MAP["TH"], PHONE_MAP["R"], PHONE_MAP["IY"]],
-    "four":    [PHONE_MAP["F"], PHONE_MAP["AO"], PHONE_MAP["R"]],
-    "five":    [PHONE_MAP["F"], PHONE_MAP["AY"], PHONE_MAP["V"]],
-    "six":     [PHONE_MAP["S"], PHONE_MAP["IH"], PHONE_MAP["K"], PHONE_MAP["S"]],
-    "seven":   [PHONE_MAP["S"], PHONE_MAP["EH"], PHONE_MAP["V"], PHONE_MAP["AH"], PHONE_MAP["N"]],
-    "eight":   [PHONE_MAP["EY"], PHONE_MAP["T"]],
-    "nine":    [PHONE_MAP["N"], PHONE_MAP["AY"], PHONE_MAP["N"]],
+_DIGIT_PRONS = {
+    "zero":  ["Z", "IY", "R", "OW"],
+    "one":   ["W", "AH", "N"],
+    "two":   ["T", "UW"],
+    "three": ["TH", "R", "IY"],
+    "four":  ["F", "AO", "R"],
+    "five":  ["F", "AY", "V"],
+    "six":   ["S", "IH", "K", "S"],
+    "seven": ["S", "EH", "V", "AH", "N"],
+    "eight": ["EY", "T"],
+    "nine":  ["N", "AY", "N"],
 }
 
-# All digit words in sorted order
-WORDS = sorted(LEXICON.keys())
+DIGITS = Lexicon(_DIGIT_PHONES, _DIGIT_PRONS)
 
-# Word-to-ID mapping
-WORD_MAP = {w: i for i, w in enumerate(WORDS)}
-WORD_IDS = {i: w for w, i in WORD_MAP.items()}
-NUM_WORDS = len(WORDS)
-
-# A word ID for sentence start/end markers (used in LM)
-START_WORD = NUM_WORDS       # <s>
-END_WORD = NUM_WORDS + 1     # </s>
-SENTENCE_BEGIN = START_WORD
-SENTENCE_END = END_WORD
+# FSDD transcripts use digit characters; map them to lexicon words.
+DIGIT_WORDS = {
+    "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
+    "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
+}
 
 
-def phone_symbols(phone_ids):
-    """Convert a list of phone IDs to phone symbols for display."""
-    return [PHONE_IDS[pid] for pid in phone_ids]
+# ---------------------------------------------------------------------------
+# Task: YesNo (Kaldi egs/yesno)
+# ---------------------------------------------------------------------------
+# Same design as Kaldi's yesno recipe: one phone per word plus silence.
+# The audio is Hebrew ken/lo; transcripts use yes/no.
 
+_YESNO_PHONES = {"SIL": 0, "Y": 1, "N": 2}
 
-def word_phones(word):
-    """Get phone sequence for a word (as phone symbols)."""
-    return phone_symbols(LEXICON[word])
+_YESNO_PRONS = {
+    "yes": ["Y"],
+    "no":  ["N"],
+}
 
-
-def phone_id(symbol: str) -> int:
-    """Get the integer ID for a phone symbol."""
-    return PHONE_MAP[symbol]
-
-
-def word_id(word: str) -> int:
-    """Get the integer ID for a word."""
-    return WORD_MAP[word]
+YESNO = Lexicon(_YESNO_PHONES, _YESNO_PRONS)
 
 
 if __name__ == "__main__":
-    print(f"Phone set ({NUM_PHONES} phones):")
-    for sym, pid in sorted(PHONE_MAP.items(), key=lambda x: x[1]):
-        print(f"  {pid:3d}: {sym}")
-
-    print(f"\nLexicon ({NUM_WORDS} words):")
-    for word in WORDS:
-        phones = [PHONE_IDS[p] for p in LEXICON[word]]
-        print(f"  {word:8s}: {' '.join(phones)}")
-
-    print(f"\nWord IDs:")
-    for w, wid in sorted(WORD_MAP.items(), key=lambda x: x[1]):
-        print(f"  {wid:3d}: {w}")
-    print(f"  {START_WORD:3d}: <s>")
-    print(f"  {END_WORD:3d}: </s>")
+    for name, lex in [("DIGITS", DIGITS), ("YESNO", YESNO)]:
+        print(f"{name}: {lex}")
+        for word in lex.words:
+            phones = [lex.phone_ids[p] for p in lex.lexicon[word]]
+            print(f"  {word:8s} ({lex.word_map[word]}): {' '.join(phones)}")
+        print(f"  <s>={lex.start_word} </s>={lex.end_word}")
