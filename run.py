@@ -166,6 +166,10 @@ TASKS = {
 def main():
     parser = argparse.ArgumentParser(description="Mini Kaldi monophone recognizer")
     parser.add_argument("--task", choices=sorted(TASKS.keys()), default="yesno")
+    parser.add_argument("--tri", action="store_true",
+                        help="train context-dependent triphones (decision-tree tied states) on top of the monophone bootstrap")
+    parser.add_argument("--leaves", type=int, default=200, help="triphone tree: target tied senones")
+    parser.add_argument("--mincount", type=int, default=300, help="triphone tree: min frames per split child")
     args = parser.parse_args()
 
     np.random.seed(0)  # reproducible EM runs
@@ -214,14 +218,33 @@ def main():
                  sil_between=task["sil_between"], verbose=True)
     print(f"  Training time: {(time.time() - t0)/60:.1f} min")
 
+    # ---- Step 3b: (optional) train context-dependent triphones ----
+    if args.tri:
+        from triphone import train_triphone, build_triphone_hl
+        print("\n[3b] Training triphones (decision-tree tied states)...")
+        t0 = time.time()
+        tree, gmms = train_triphone(train_transcripts, train_frames, lex, gmms,
+                                    max_leaves=args.leaves, min_count=args.mincount,
+                                    component_levels=task["component_levels"],
+                                    sil_between=task["sil_between"], verbose=True)
+        print(f"  Triphone training time: {(time.time() - t0)/60:.1f} min")
+
     # ---- Step 4: Build decoder graph ----
-    print("\n[4/5] Building HCLG decoder graph (H ∘ L ∘ G)...")
+    print("\n[4/5] Building decoder graph...")
     t0 = time.time()
-    phone_hmms = build_all_phone_hmms(lex.num_phones)
     lm = train_lm(train_transcripts, lex)
     print(f"  LM: {lm}")
-    hclg = assemble_hclg(phone_hmms, lm, lex, word_penalty=task["word_penalty"],
-                         g_mode=task["g_mode"])
+    if args.tri:
+        from decoder import build_unigram_g
+        from fst import compose
+        hl = build_triphone_hl(lex, tree)
+        include_lm = not task.get("lm_otf")
+        g = build_unigram_g(lm, lex, word_penalty=task["word_penalty"], include_lm=include_lm)
+        hclg = compose(hl, g)
+    else:
+        phone_hmms = build_all_phone_hmms(lex.num_phones)
+        hclg = assemble_hclg(phone_hmms, lm, lex, word_penalty=task["word_penalty"],
+                             g_mode=task["g_mode"])
     print(f"  Build time: {time.time() - t0:.1f}s  ({hclg.num_states} states)")
 
     # ---- Step 5: Decode and evaluate ----
