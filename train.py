@@ -277,11 +277,21 @@ def reestimate_gmms(
     all_frames = np.vstack(frames_list)
     all_align = np.concatenate(alignments).astype(int)
 
+    def largest_pow2_le(x: int) -> int:
+        k = 1
+        while k * 2 <= x:
+            k *= 2
+        return k
+
     new_gmms = []
     for p in range(num_pdfs):
         rows = all_frames[all_align == p]
         if len(rows) >= min_occupancy:
-            actual_k = min(len(rows), n_components)
+            # Train a power-of-2 component count so the doubling split below
+            # lands exactly on n_components. Training e.g. K=3 then doubling
+            # to 6 would overshoot and leave GMMs with mismatched component
+            # counts, which breaks vectorized batch scoring.
+            actual_k = largest_pow2_le(min(len(rows), n_components))
             gmm = train_gmm(rows, n_components=actual_k, n_iter=EM_ITERS)
         else:
             # Keep old GMM at whatever K it had

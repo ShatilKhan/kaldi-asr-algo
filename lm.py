@@ -38,6 +38,10 @@ class LanguageModel:
         self.unigrams: Dict[int, float] = {}
         self.bigrams: Dict[Tuple[int, int], float] = {}
         self.backoff: Dict[int, float] = {}
+        # (prev, word) pairs actually observed in training. The dense `bigrams`
+        # table smooths over all V^2 pairs; the backoff G FST only materializes
+        # these seen ones plus a backoff arc, keeping the graph small.
+        self.seen_bigrams: set = set()
 
     def unigram_prob(self, word_id: int) -> float:
         """Get the log-probability of a word (unigram)."""
@@ -118,6 +122,8 @@ def train_lm(
         for i in range(1, len(all_ids)):
             key = (all_ids[i - 1], all_ids[i])
             bigram_counts[key] = bigram_counts.get(key, 0) + 1
+
+    lm.seen_bigrams = set(bigram_counts.keys())
 
     # Total unigram count
     total_unigrams = sum(unigram_counts.values())

@@ -21,12 +21,16 @@ import numpy as np
 
 from feats import extract_mfcc, trim_silence
 from hmm import build_all_phone_hmms
-from lexicon import DIGITS, YESNO, SPEECH_COMMANDS, DIGIT_WORDS
+from lexicon import DIGITS, YESNO, SPEECH_COMMANDS, DIGIT_WORDS, load_pronunciation_lexicon
 from lm import train_lm
 from decoder import decode, assemble_hclg
 from train import train
 from eval import WERStats
 
+
+# Each loader returns (train_data, test_data, lexicon) where *_data is a list
+# of (transcript, samples, sample_rate). The lexicon is returned because some
+# tasks (libri) build it dynamically from the data's vocabulary.
 
 def load_digits():
     """FSDD: spoken digits, one word per test utterance."""
@@ -42,7 +46,7 @@ def load_digits():
 
     train_data = [(text_of(r), r["samples"], r["sample_rate"]) for r in train_records]
     test_data = [(text_of(r), r["samples"], r["sample_rate"]) for r in test_records]
-    return train_data, test_data
+    return train_data, test_data, DIGITS
 
 
 def load_yesno():
@@ -52,7 +56,7 @@ def load_yesno():
     train_records, test_records = prepare_yesno()
     train_data = [(r["text"], r["samples"], r["sample_rate"]) for r in train_records]
     test_data = [(r["text"], r["samples"], r["sample_rate"]) for r in test_records]
-    return train_data, test_data
+    return train_data, test_data, YESNO
 
 
 def load_commands():
@@ -63,7 +67,48 @@ def load_commands():
         SPEECH_COMMANDS.words, train_per_word=200, test_per_word=50)
     train_data = [(r["text"], r["samples"], r["sample_rate"]) for r in train_records]
     test_data = [(r["text"], r["samples"], r["sample_rate"]) for r in test_records]
-    return train_data, test_data
+    return train_data, test_data, SPEECH_COMMANDS
+
+
+def load_libri(max_words=16, lexicon_path="data/librispeech/librispeech-lexicon.txt"):
+    """
+    Mini LibriSpeech continuous ASR on a small closed vocabulary.
+
+    LibriSpeech is open-vocabulary, so a held-out dev set never reuses a small
+    train vocab. Instead we take the short (<= max_words) utterances of
+    train-clean-5, keep those whose every word is in the pronunciation
+    dictionary, and split them speaker-disjointly. Train and test therefore
+    share one closed vocabulary, and test speakers are unseen.
+    """
+    from data.libri import load_libri as _load_libri, load_audio
+
+    recs = [r for r in _load_libri("train-clean-5") if len(r["text"].split()) <= max_words]
+
+    dict_words = set()
+    with open(lexicon_path, encoding="utf-8") as f:
+        for line in f:
+            p = line.split()
+            if p:
+                dict_words.add(p[0].lower())
+    recs = [r for r in recs if all(w in dict_words for w in r["text"].split())]
+
+    vocab = sorted({w for r in recs for w in r["text"].split()})
+    lex = load_pronunciation_lexicon(lexicon_path, vocab=vocab)
+
+    speakers = sorted({r["speaker"] for r in recs})
+    test_speakers = set(speakers[::5])  # ~20% held out
+    train_recs = [r for r in recs if r["speaker"] not in test_speakers]
+    test_recs = [r for r in recs if r["speaker"] in test_speakers]
+
+    def to_data(rs):
+        out = []
+        for r in rs:
+            samples, sr = load_audio(r)
+            out.append((r["text"], samples, sr))
+        return out
+
+    print(f"  LibriSpeech: vocab={lex.num_words} words, {len(train_recs)} train / {len(test_recs)} test (speaker-disjoint)")
+    return to_data(train_recs), to_data(test_recs), lex
 
 
 # Per-task settings. word_penalty and acoustic_scale were tuned on the
@@ -84,6 +129,11 @@ TASKS = {
         "trim": True, "word_penalty": 0.0, "acoustic_scale": 0.0833,
         "component_levels": [1, 2, 4], "g_mode": "unigram", "beam": 20.0,
     },
+    "libri": {
+        "loader": load_libri, "lexicon": None, "sil_between": True,
+        "trim": True, "word_penalty": 0.0, "acoustic_scale": 0.0833,
+        "component_levels": [1, 2, 4], "g_mode": "unigram", "beam": 12.0,
+    },
 }
 
 
@@ -95,7 +145,6 @@ def main():
     np.random.seed(0)  # reproducible EM runs
 
     task = TASKS[args.task]
-    lex = task["lexicon"]
 
     print("=" * 60)
     print(f"  Kaldi Mini-Implementation — task: {args.task}")
@@ -104,7 +153,7 @@ def main():
 
     # ---- Step 1: Data ----
     print("\n[1/5] Loading data...")
-    train_data, test_data = task["loader"]()
+    train_data, test_data, lex = task["loader"]()
     print(f"  Train: {len(train_data)} utterances")
     print(f"  Test:  {len(test_data)} utterances")
 
