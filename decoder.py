@@ -163,13 +163,25 @@ def build_g_fst(lm, lex: Lexicon, word_penalty: float = 0.0) -> FST:
     return g
 
 
-def _prune(tokens: dict, beam: float) -> dict:
-    """Drop tokens whose cost is worse than (best cost + beam)."""
-    if beam == float("inf") or not tokens:
+def _prune(tokens: dict, beam: float, max_active: int = 0) -> dict:
+    """
+    Beam + histogram pruning.
+
+    beam: drop tokens worse than best + beam.
+    max_active: hard cap on surviving tokens (Kaldi's max-active). This bounds
+    memory, which matters for the on-the-fly bigram where tokens are keyed by
+    (state, last_word) and can otherwise blow up and OOM the process.
+    """
+    if not tokens:
         return tokens
-    best = min(s for s, _ in tokens.values())
-    cutoff = best + beam
-    return {st: v for st, v in tokens.items() if v[0] <= cutoff}
+    if beam != float("inf"):
+        best = min(s for s, _ in tokens.values())
+        cutoff = best + beam
+        tokens = {st: v for st, v in tokens.items() if v[0] <= cutoff}
+    if max_active and len(tokens) > max_active:
+        kept = sorted(tokens.items(), key=lambda kv: kv[1][0])[:max_active]
+        tokens = dict(kept)
+    return tokens
 
 
 def build_unigram_g(lm, lex: Lexicon, word_penalty: float = 0.0,
@@ -205,6 +217,7 @@ def decode(
     acoustic_scale: float = 0.0833,
     beam: float = float("inf"),
     lm=None,
+    max_active: int = 2000,
 ) -> List[int]:
     """
     Decode an utterance: Viterbi token-passing on HCLG (paper Section VIII).
@@ -302,7 +315,7 @@ def decode(
                 if cur is None or ncost < cur[0]:
                     new_tokens[nkey] = (ncost, nbp)
 
-        tokens = _prune(close(new_tokens), beam)
+        tokens = _prune(close(new_tokens), beam, max_active)
         if not tokens:
             return []
 
