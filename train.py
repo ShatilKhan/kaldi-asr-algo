@@ -28,7 +28,7 @@ from data.reader import prepare_dataset
 from feats import extract_mfcc
 from hmm import build_all_phone_hmms, build_utterance_hmm, total_pdfs
 from gmm import DiagGmm, train_gmm
-from lexicon import LEXICON, WORD_MAP, PHONE_MAP, NUM_PHONES, SIL_PHONE
+from lexicon import Lexicon
 
 
 # Training constants
@@ -39,26 +39,20 @@ EM_ITERS = 20             # EM iterations for each training call
 MIN_OCCUPANCY = 1         # minimum frames per pdf-id to update GMM
 
 
-# Map FSDD digit strings (0-9) to lexicon word names
-_DIGIT_MAP = {
-    "0": "zero", "1": "one", "2": "two", "3": "three", "4": "four",
-    "5": "five", "6": "six", "7": "seven", "8": "eight", "9": "nine",
-}
-
-
-def build_phone_sequence(transcript: str) -> List[int]:
+def build_phone_sequence(transcript: str, lex: Lexicon, sil_between: bool = False) -> List[int]:
     """
-    Convert a transcript (e.g., "three five seven" or "3 5 7") to a flat
-    list of phone IDs. Includes silence at start and end.
+    Convert a transcript (e.g., "three five seven") to a flat list of phone
+    IDs. Includes silence at start and end, and optionally between words
+    (useful for datasets with real pauses, like yesno).
     """
     words = transcript.strip().lower().split()
-    phones = [SIL_PHONE]
-    for word in words:
-        # Map digit strings to word names (FSDD stores digits like '0', not 'zero')
-        mapped = _DIGIT_MAP.get(word, word)
-        if mapped in LEXICON:
-            phones.extend(LEXICON[mapped])
-    phones.append(SIL_PHONE)
+    phones = [lex.sil_phone]
+    for i, word in enumerate(words):
+        if word in lex.lexicon:
+            if sil_between and i > 0:
+                phones.append(lex.sil_phone)
+            phones.extend(lex.lexicon[word])
+    phones.append(lex.sil_phone)
     return phones
 
 
@@ -190,13 +184,22 @@ def viterbi_align(
         # Add emission score
         dp[t] = best + log_likes[t, pdf_ids] * acoustic_scale
 
-    # Traceback
-    best_final = int(np.argmax(dp[-1]))
+    # Traceback. This is FORCED alignment: the path must end in the LAST
+    # HMM state of the sequence, otherwise later phones get no frames and
+    # their GMMs never move off the flat start.
+    best_final = num_states - 1
+    if dp[-1, best_final] <= -1e29:
+        # Last state unreachable (utterance shorter than the state chain);
+        # fall back to the best reachable state.
+        best_final = int(np.argmax(dp[-1]))
+    # back[t, s] is a CHOICE flag from argmax([self, forward]):
+    #   0 = predecessor is s itself (self-loop), 1 = predecessor is s - 1.
+    # Convert flag -> predecessor state by subtracting it.
     align = np.zeros(num_frames, dtype=int)
     align[-1] = pdf_ids[best_final]
     prev_state = best_final
     for t in range(num_frames - 2, -1, -1):
-        prev_state = back[t + 1, prev_state]
+        prev_state = prev_state - back[t + 1, prev_state]
         align[t] = pdf_ids[prev_state]
 
     return align
@@ -328,9 +331,10 @@ def compute_total_log_likelihood(
 def train(
     transcripts: List[str],
     frames_list: List[np.ndarray],
-    num_phones: int = NUM_PHONES,
+    lex: Lexicon,
     component_levels: List[int] = None,
     iters_per_level: int = N_ITERS_AFTER_SPLIT,
+    sil_between: bool = False,
     verbose: bool = True,
 ) -> List[DiagGmm]:
     """
@@ -339,9 +343,10 @@ def train(
     Args:
         transcripts: list of text transcripts.
         frames_list: list of (num_frames, D) MFCC arrays.
-        num_phones: number of phones.
+        lex: the task Lexicon (phone set + pronunciations).
         component_levels: list of GMM component counts [1, 2, 4].
         iters_per_level: iterations per component level.
+        sil_between: insert silence between words in training phone sequences.
         verbose: if True, print progress.
 
     Returns:
@@ -351,16 +356,16 @@ def train(
         component_levels = N_COMPONENTS
 
     # Build phone HMMs
-    phone_hmms = build_all_phone_hmms(num_phones)
+    phone_hmms = build_all_phone_hmms(lex.num_phones)
     npdfs = total_pdfs(phone_hmms)
     D = frames_list[0].shape[1]
 
     if verbose:
-        print(f"Training {num_phones} phones, {npdfs} pdf-ids, {D}-dim features")
+        print(f"Training {lex.num_phones} phones, {npdfs} pdf-ids, {D}-dim features")
         print(f"  {len(frames_list)} utterances")
 
     # Build phone sequences for all utterances
-    all_phone_seqs = [build_phone_sequence(t) for t in transcripts]
+    all_phone_seqs = [build_phone_sequence(t, lex, sil_between=sil_between) for t in transcripts]
 
     # Initialize GMMs
     gmms = flat_start_initialize(frames_list, npdfs, n_components=component_levels[0])
@@ -462,7 +467,8 @@ if __name__ == "__main__":
     print(f"Loaded {len(train_records)} training, {len(test_records)} test recordings")
 
     # Extract transcripts and MFCCs for training
-    transcripts = [r["digit"] for r in train_records]
+    from lexicon import DIGITS, DIGIT_WORDS
+    transcripts = [" ".join(DIGIT_WORDS[d] for d in r["digit"].split()) for r in train_records]
     frames_list = [extract_mfcc(r["samples"], r["sample_rate"]) for r in train_records]
 
     # Filter out empty frames
@@ -474,7 +480,7 @@ if __name__ == "__main__":
     frames_list = list(frames_list)
 
     # Train
-    gmms = train(transcripts, frames_list, NUM_PHONES, verbose=True)
+    gmms = train(transcripts, frames_list, DIGITS, verbose=True)
 
     # Save model
     os.makedirs("models", exist_ok=True)
