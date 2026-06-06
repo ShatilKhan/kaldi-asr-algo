@@ -1,98 +1,136 @@
 """
-Kaldi mini-implementation: end-to-end monophone GMM-HMM digit recognizer.
+Kaldi mini-implementation: end-to-end monophone GMM-HMM recognizer.
 
 Pipeline:
-  1. Download FSDD dataset
+  1. Download dataset (FSDD digits or YesNo)
   2. Compute MFCC features
   3. Train monophone GMM-HMM (flat start → align → re-estimate → split)
   4. Build HCLG decoder graph (H ∘ L ∘ G)
   5. Decode test utterances
   6. Evaluate WER/CER/SER with bootstrap CI
-  7. Show sample outputs
+
+Usage:
+  uv run python run.py --task yesno
+  uv run python run.py --task digits
 """
 
-import sys
-import os
+import argparse
 import time
-import random
+
 import numpy as np
 
-# Local imports
-from data.download_fsdd import ensure_fsdd
-from data.reader import prepare_dataset
-from feats import extract_mfcc
-from hmm import build_all_phone_hmms, total_pdfs
-from gmm import DiagGmm
-from lexicon import LEXICON, WORD_MAP, WORD_IDS, WORDS, NUM_PHONES
+from feats import extract_mfcc, trim_silence
+from hmm import build_all_phone_hmms
+from lexicon import DIGITS, YESNO, DIGIT_WORDS
 from lm import train_lm
-from fst import compose, best_path
-from decoder import build_h_fst, build_l_fst, build_g_fst, decode, assemble_hclg
-from train import train, save_model, load_model, build_phone_sequence
+from decoder import decode, assemble_hclg
+from train import train
 from eval import WERStats
 
 
+def load_digits():
+    """FSDD: spoken digits, one word per test utterance."""
+    from data.download_fsdd import ensure_fsdd
+    from data.reader import prepare_dataset
+
+    data_dir = ensure_fsdd()
+    train_records, test_records = prepare_dataset(data_dir)
+
+    def text_of(r):
+        raw = r.get("text", r["digit"])
+        return " ".join(DIGIT_WORDS[d] for d in raw.split())
+
+    train_data = [(text_of(r), r["samples"], r["sample_rate"]) for r in train_records]
+    test_data = [(text_of(r), r["samples"], r["sample_rate"]) for r in test_records]
+    return train_data, test_data
+
+
+def load_yesno():
+    """YesNo: 8-word yes/no sequences, 31 train / 29 test."""
+    from data.yesno import prepare_yesno
+
+    train_records, test_records = prepare_yesno()
+    train_data = [(r["text"], r["samples"], r["sample_rate"]) for r in train_records]
+    test_data = [(r["text"], r["samples"], r["sample_rate"]) for r in test_records]
+    return train_data, test_data
+
+
+# Per-task settings. word_penalty and acoustic_scale were tuned on the
+# yesno dev split; trim applies energy endpointing (see feats.trim_silence).
+TASKS = {
+    "digits": {
+        "loader": load_digits, "lexicon": DIGITS, "sil_between": False,
+        "trim": False, "word_penalty": 0.0, "acoustic_scale": 0.0833,
+        "component_levels": [1, 2, 4],
+    },
+    "yesno": {
+        "loader": load_yesno, "lexicon": YESNO, "sil_between": True,
+        "trim": True, "word_penalty": 6.0, "acoustic_scale": 0.05,
+        "component_levels": [1, 2, 4, 8],
+    },
+}
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Mini Kaldi monophone recognizer")
+    parser.add_argument("--task", choices=sorted(TASKS.keys()), default="yesno")
+    args = parser.parse_args()
+
+    np.random.seed(0)  # reproducible EM runs
+
+    task = TASKS[args.task]
+    lex = task["lexicon"]
+
     print("=" * 60)
-    print("  Kaldi Mini-Implementation: Digit Speech Recognizer")
+    print(f"  Kaldi Mini-Implementation — task: {args.task}")
     print("  Povey et al., 'The Kaldi Speech Recognition Toolkit' (2011)")
     print("=" * 60)
 
     # ---- Step 1: Data ----
     print("\n[1/5] Loading data...")
-    data_dir = ensure_fsdd()
-    train_records, test_records = prepare_dataset(data_dir)
-    print(f"  Train: {len(train_records)} utterances ({len(set(r['speaker'] for r in train_records))} speakers)")
-    print(f"  Test:  {len(test_records)} utterances ({len(set(r['speaker'] for r in test_records))} speakers)")
+    train_data, test_data = task["loader"]()
+    print(f"  Train: {len(train_data)} utterances")
+    print(f"  Test:  {len(test_data)} utterances")
 
     # ---- Step 2: Feature extraction ----
     print("\n[2/5] Extracting MFCC features...")
     t0 = time.time()
 
-    train_transcripts = [r["digit"] for r in train_records]
-    test_transcripts = [r["digit"] for r in test_records]
+    def feats_of(samples, sr):
+        if task["trim"]:
+            samples = trim_silence(samples, sr)
+        return extract_mfcc(samples, sr)
 
-    train_frames = [extract_mfcc(r["samples"], r["sample_rate"]) for r in train_records]
-    test_frames = [extract_mfcc(r["samples"], r["sample_rate"]) for r in test_records]
+    train_set = [(text, feats_of(samples, sr)) for text, samples, sr in train_data]
+    test_set = [(text, feats_of(samples, sr)) for text, samples, sr in test_data]
+    train_set = [(t, f) for t, f in train_set if f.shape[0] > 0]
+    test_set = [(t, f) for t, f in test_set if f.shape[0] > 0]
 
-    # Filter empty
-    train_valid = [(t, f) for t, f in zip(train_transcripts, train_frames) if f.shape[0] > 0]
-    test_valid = [(t, f) for t, f in zip(test_transcripts, test_frames) if f.shape[0] > 0]
-    train_transcripts, train_frames = zip(*train_valid)
-    test_transcripts, test_frames = zip(*test_valid)
+    train_transcripts = [t for t, _ in train_set]
+    train_frames = [f for _, f in train_set]
+    test_transcripts = [t for t, _ in test_set]
+    test_frames = [f for _, f in test_set]
 
-    t1 = time.time()
     print(f"  Train: {len(train_frames)} utterances, {sum(f.shape[0] for f in train_frames)} frames")
     print(f"  Test:  {len(test_frames)} utterances, {sum(f.shape[0] for f in test_frames)} frames")
-    print(f"  Time:  {t1 - t0:.1f}s")
+    print(f"  Time:  {time.time() - t0:.1f}s")
 
     # ---- Step 3: Train monophone GMM-HMM ----
     print("\n[3/5] Training monophone GMM-HMM...")
     t0 = time.time()
-
-    train_transcripts_list = list(train_transcripts)
-    train_frames_list = list(train_frames)
-
-    gmms = train(train_transcripts_list, train_frames_list, NUM_PHONES, verbose=True)
-
-    t1 = time.time()
-    print(f"  Training time: {(t1 - t0)/60:.1f} min")
+    gmms = train(train_transcripts, train_frames, lex,
+                 component_levels=task["component_levels"],
+                 sil_between=task["sil_between"], verbose=True)
+    print(f"  Training time: {(time.time() - t0)/60:.1f} min")
 
     # ---- Step 4: Build decoder graph ----
     print("\n[4/5] Building HCLG decoder graph (H ∘ L ∘ G)...")
     t0 = time.time()
-
-    phone_hmms = build_all_phone_hmms(NUM_PHONES)
-
-    # Train LM on training transcripts
-    lm = train_lm(train_transcripts_list)
+    phone_hmms = build_all_phone_hmms(lex.num_phones)
+    lm = train_lm(train_transcripts, lex)
     print(f"  LM: {lm}")
-
-    # Build HCLG
-    hclg = assemble_hclg(phone_hmms, lm)
-
-    t1 = time.time()
-    print(f"  Decoder graph: {hclg.num_states} states, {hclg.num_arcs} arcs")
-    print(f"  Build time: {t1 - t0:.1f}s")
+    hclg = assemble_hclg(phone_hmms, lm, lex, word_penalty=task["word_penalty"])
+    print(f"  Build time: {time.time() - t0:.1f}s")
 
     # ---- Step 5: Decode and evaluate ----
     print("\n[5/5] Decoding test utterances...")
@@ -103,22 +141,19 @@ def main():
     hyps_list = []
 
     for i, (frames, ref_text) in enumerate(zip(test_frames, test_transcripts)):
-        # Decode
-        word_ids = decode(frames, gmms, hclg)
-        hyp_words = [WORD_IDS[wid] for wid in word_ids if wid in WORD_IDS]
-
-        ref_words = [ref_text]  # single word per utterance in FSDD
+        word_ids = decode(frames, gmms, hclg, lex.num_words,
+                          acoustic_scale=task["acoustic_scale"])
+        hyp_words = [lex.word_ids[wid] for wid in word_ids if wid in lex.word_ids]
+        ref_words = ref_text.split()
 
         refs_list.append(ref_words)
         hyps_list.append(hyp_words)
-
         stats.add(ref_words, hyp_words)
 
-        if (i + 1) % 100 == 0:
+        if (i + 1) % 10 == 0:
             print(f"    Decoded {i + 1}/{len(test_frames)}...")
 
-    t1 = time.time()
-    print(f"  Decoded {len(test_frames)} utterances in {t1 - t0:.1f}s")
+    print(f"  Decoded {len(test_frames)} utterances in {time.time() - t0:.1f}s")
 
     # Results
     print("\n" + "=" * 60)
@@ -127,24 +162,6 @@ def main():
     print()
     print(stats.report())
     print(stats.sample_outputs(refs_list, hyps_list, n=10))
-    print()
-
-    # Per-digit WER breakdown
-    print("--- Per-digit accuracy ---")
-    digit_correct = {d: 0 for d in WORDS}
-    digit_total = {d: 0 for d in WORDS}
-    for ref, hyp in zip(refs_list, hyps_list):
-        digit = ref[0]
-        digit_total[digit] = digit_total.get(digit, 0) + 1
-        if ref == hyp:
-            digit_correct[digit] = digit_correct.get(digit, 0) + 1
-
-    for digit in sorted(digit_total.keys()):
-        total = digit_total[digit]
-        correct = digit_correct.get(digit, 0)
-        pct = 100.0 * correct / total if total > 0 else 0
-        bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
-        print(f"  {digit:8s}: {bar} {pct:.0f}% ({correct}/{total})")
 
 
 if __name__ == "__main__":

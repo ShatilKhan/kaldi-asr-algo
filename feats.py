@@ -27,6 +27,37 @@ PREEMPH_ALPHA = 0.97     # pre-emphasis coefficient
 
 # ---- Utility functions ----
 
+def trim_silence(
+    samples: np.ndarray,
+    sample_rate: int,
+    thresh_ratio: float = 0.08,
+    margin_frames: int = 8,
+) -> np.ndarray:
+    """
+    Energy-based endpointing: cut leading/trailing audio whose frame RMS is
+    below thresh_ratio * max RMS, keeping a margin of context frames.
+
+    Long stretches of room noise, breaths and echo at the utterance edges
+    otherwise out-score the silence GMM and decode as spurious words. This
+    is the standard frontend fix (Kaldi recipes segment their data too).
+    """
+    n = int(sample_rate * FRAME_LEN_MS / 1000.0)
+    hop = int(sample_rate * FRAME_SHIFT_MS / 1000.0)
+    if len(samples) < n:
+        return samples
+    rms = np.array([
+        np.sqrt(np.mean(samples[i:i + n].astype(float) ** 2))
+        for i in range(0, len(samples) - n, hop)
+    ])
+    thresh = rms.max() * thresh_ratio
+    above = np.where(rms > thresh)[0]
+    if len(above) == 0:
+        return samples
+    start = max(0, (above[0] - margin_frames) * hop)
+    end = min(len(samples), (above[-1] + margin_frames) * hop + n)
+    return samples[start:end]
+
+
 def hertz_to_mel(freq: float) -> float:
     """Convert frequency in Hz to Mel scale."""
     return 2595.0 * np.log10(1.0 + freq / 700.0)
