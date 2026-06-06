@@ -1,0 +1,9 @@
+[project]
+name = "kaldi-asr-algo"
+version = "0.1.0"
+description = "A mini Kaldi: monophone GMM-HMM speech recognizer in numpy, following Povey et al. 2011"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.20.0",
+    "soundfile>=0.12.0",
+]
