@@ -161,12 +161,41 @@ def build_g_fst(lm, lex: Lexicon, word_penalty: float = 0.0) -> FST:
     return g
 
 
+def _prune(tokens: dict, beam: float) -> dict:
+    """Drop tokens whose cost is worse than (best cost + beam)."""
+    if beam == float("inf") or not tokens:
+        return tokens
+    best = min(s for s, _ in tokens.values())
+    cutoff = best + beam
+    return {st: v for st, v in tokens.items() if v[0] <= cutoff}
+
+
+def build_unigram_g(lm, lex: Lexicon, word_penalty: float = 0.0) -> FST:
+    """
+    Build a single-state unigram G.
+
+    For isolated-word tasks a bigram adds no context (one word per utterance)
+    but its V states multiply the H∘L state count during composition (the
+    epsilon filter copies every H∘L state per G state), blowing HCLG up by V×.
+    A one-state unigram keeps HCLG ≈ H∘L. Proper large-vocab continuous ASR
+    instead needs a determinized backoff bigram (Phase 2b).
+    """
+    g = FST()
+    s = g.add_state()
+    g.set_start(s)
+    g.set_final(s, 0.0)
+    for w in range(lex.num_words):
+        g.add_arc(s, Arc(s, w, w, -lm.unigram_prob(w) + word_penalty))
+    return g
+
+
 def decode(
     frames: np.ndarray,
     gmms: List[DiagGmm],
     hclg: FST,
     num_words: int,
     acoustic_scale: float = 0.0833,
+    beam: float = float("inf"),
 ) -> List[int]:
     """
     Decode an utterance: Viterbi token-passing on HCLG (paper Section VIII).
@@ -177,6 +206,8 @@ def decode(
         hclg: composed HCLG FST.
         num_words: vocabulary size (olabels >= num_words are not words).
         acoustic_scale: weight on acoustic scores vs graph scores.
+        beam: prune tokens with cost > best + beam each frame (inf = no prune).
+              Required to keep large-vocabulary HCLG search tractable.
 
     Returns:
         List of word IDs (the hypothesized word sequence).
@@ -239,7 +270,7 @@ def decode(
                             new_tokens[arc.next_state] = (new_score, new_out)
                             changed = True
 
-        tokens = new_tokens
+        tokens = _prune(new_tokens, beam)
         if not tokens:
             return []
 
@@ -261,9 +292,14 @@ def decode(
     return best_seq
 
 
-def assemble_hclg(phone_hmms: list, lm, lex: Lexicon, word_penalty: float = 0.0) -> FST:
+def assemble_hclg(phone_hmms: list, lm, lex: Lexicon,
+                  word_penalty: float = 0.0, g_mode: str = "bigram") -> FST:
     """
     Build the full HCLG = H ∘ L ∘ G decoder graph (paper Section VII).
+
+    g_mode "bigram" uses the dense bigram G (fine for small vocab: yesno,
+    digits); "unigram" uses a one-state unigram G to keep HCLG compact for
+    larger isolated-word vocab (speech commands).
     """
     print("  Building H FST...")
     h = build_h_fst(phone_hmms)
@@ -273,8 +309,11 @@ def assemble_hclg(phone_hmms: list, lm, lex: Lexicon, word_penalty: float = 0.0)
     l = build_l_fst(lex)
     print(f"    L: {l.print_stats()}")
 
-    print("  Building G FST...")
-    g = build_g_fst(lm, lex, word_penalty=word_penalty)
+    print(f"  Building G FST ({g_mode})...")
+    if g_mode == "unigram":
+        g = build_unigram_g(lm, lex, word_penalty=word_penalty)
+    else:
+        g = build_g_fst(lm, lex, word_penalty=word_penalty)
     print(f"    G: {g.print_stats()}")
 
     print("  Composing H ∘ L...")

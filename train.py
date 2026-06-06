@@ -271,25 +271,18 @@ def reestimate_gmms(
         Updated list of DiagGmm.
     """
     num_pdfs = len(old_gmms)
-    D = frames_list[0].shape[1]
 
-    # Collect frames per pdf-id
-    pdf_frames = [[] for _ in range(num_pdfs)]
+    # Stack everything once, then select per pdf-id with a boolean mask.
+    # Much lighter than appending 100k+ frame rows into Python lists.
+    all_frames = np.vstack(frames_list)
+    all_align = np.concatenate(alignments).astype(int)
 
-    for frames, align in zip(frames_list, alignments):
-        for t, pdf_id in enumerate(align):
-            if 0 <= pdf_id < num_pdfs:
-                pdf_frames[pdf_id].append(frames[t])
-
-    # Train new GMMs — all must end up with the same K for vectorized scoring
     new_gmms = []
     for p in range(num_pdfs):
-        n_frames = len(pdf_frames[p])
-        if n_frames >= min_occupancy:
-            train_frames = np.array(pdf_frames[p])
-            # Train with as many components as we have data for
-            actual_k = min(n_frames, n_components)
-            gmm = train_gmm(train_frames, n_components=actual_k, n_iter=EM_ITERS)
+        rows = all_frames[all_align == p]
+        if len(rows) >= min_occupancy:
+            actual_k = min(len(rows), n_components)
+            gmm = train_gmm(rows, n_components=actual_k, n_iter=EM_ITERS)
         else:
             # Keep old GMM at whatever K it had
             gmm = old_gmms[p]

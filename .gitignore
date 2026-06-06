@@ -4,3 +4,6 @@ data/fsdd/
 data/yesno/
 models/
 .venv/
+_bench.py
+data/speech_commands/
+data/librispeech/

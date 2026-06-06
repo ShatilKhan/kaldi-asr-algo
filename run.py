@@ -21,7 +21,7 @@ import numpy as np
 
 from feats import extract_mfcc, trim_silence
 from hmm import build_all_phone_hmms
-from lexicon import DIGITS, YESNO, DIGIT_WORDS
+from lexicon import DIGITS, YESNO, SPEECH_COMMANDS, DIGIT_WORDS
 from lm import train_lm
 from decoder import decode, assemble_hclg
 from train import train
@@ -55,18 +55,34 @@ def load_yesno():
     return train_data, test_data
 
 
+def load_commands():
+    """Speech Commands v0.02: 35 isolated words, official speaker-disjoint split."""
+    from data.speech_commands import prepare_speech_commands
+
+    train_records, test_records = prepare_speech_commands(
+        SPEECH_COMMANDS.words, train_per_word=200, test_per_word=50)
+    train_data = [(r["text"], r["samples"], r["sample_rate"]) for r in train_records]
+    test_data = [(r["text"], r["samples"], r["sample_rate"]) for r in test_records]
+    return train_data, test_data
+
+
 # Per-task settings. word_penalty and acoustic_scale were tuned on the
 # yesno dev split; trim applies energy endpointing (see feats.trim_silence).
 TASKS = {
     "digits": {
         "loader": load_digits, "lexicon": DIGITS, "sil_between": False,
         "trim": False, "word_penalty": 0.0, "acoustic_scale": 0.0833,
-        "component_levels": [1, 2, 4],
+        "component_levels": [1, 2, 4], "g_mode": "bigram", "beam": float("inf"),
     },
     "yesno": {
         "loader": load_yesno, "lexicon": YESNO, "sil_between": True,
         "trim": True, "word_penalty": 6.0, "acoustic_scale": 0.05,
-        "component_levels": [1, 2, 4, 8],
+        "component_levels": [1, 2, 4, 8], "g_mode": "bigram", "beam": float("inf"),
+    },
+    "commands": {
+        "loader": load_commands, "lexicon": SPEECH_COMMANDS, "sil_between": False,
+        "trim": True, "word_penalty": 0.0, "acoustic_scale": 0.0833,
+        "component_levels": [1, 2, 4], "g_mode": "unigram", "beam": 20.0,
     },
 }
 
@@ -129,8 +145,9 @@ def main():
     phone_hmms = build_all_phone_hmms(lex.num_phones)
     lm = train_lm(train_transcripts, lex)
     print(f"  LM: {lm}")
-    hclg = assemble_hclg(phone_hmms, lm, lex, word_penalty=task["word_penalty"])
-    print(f"  Build time: {time.time() - t0:.1f}s")
+    hclg = assemble_hclg(phone_hmms, lm, lex, word_penalty=task["word_penalty"],
+                         g_mode=task["g_mode"])
+    print(f"  Build time: {time.time() - t0:.1f}s  ({hclg.num_states} states)")
 
     # ---- Step 5: Decode and evaluate ----
     print("\n[5/5] Decoding test utterances...")
@@ -142,7 +159,7 @@ def main():
 
     for i, (frames, ref_text) in enumerate(zip(test_frames, test_transcripts)):
         word_ids = decode(frames, gmms, hclg, lex.num_words,
-                          acoustic_scale=task["acoustic_scale"])
+                          acoustic_scale=task["acoustic_scale"], beam=task["beam"])
         hyp_words = [lex.word_ids[wid] for wid in word_ids if wid in lex.word_ids]
         ref_words = ref_text.split()
 
@@ -162,6 +179,21 @@ def main():
     print()
     print(stats.report())
     print(stats.sample_outputs(refs_list, hyps_list, n=10))
+
+    # Per-word accuracy breakdown for single-word tasks
+    if all(len(r) == 1 for r in refs_list):
+        correct, total = {}, {}
+        for ref, hyp in zip(refs_list, hyps_list):
+            w = ref[0]
+            total[w] = total.get(w, 0) + 1
+            if hyp == ref:
+                correct[w] = correct.get(w, 0) + 1
+        acc = sum(correct.values()) / max(1, sum(total.values()))
+        print(f"\n--- Per-word accuracy (overall {100*acc:.1f}%) ---")
+        for w in sorted(total):
+            pct = 100.0 * correct.get(w, 0) / total[w]
+            bar = "#" * int(pct / 5)
+            print(f"  {w:9s}: {bar:20s} {pct:4.0f}% ({correct.get(w, 0)}/{total[w]})")
 
 
 if __name__ == "__main__":

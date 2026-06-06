@@ -44,6 +44,42 @@ class Lexicon:
     def __repr__(self) -> str:
         return f"Lexicon({self.num_words} words, {self.num_phones} phones)"
 
+    @classmethod
+    def from_prons(cls, prons: Dict[str, List[str]], sil: str = "SIL") -> "Lexicon":
+        """Build a Lexicon deriving the phone set from the pronunciations."""
+        phones = sorted({p for seq in prons.values() for p in seq})
+        phone_map = {sil: 0}
+        for i, p in enumerate(phones, start=1):
+            phone_map[p] = i
+        return cls(phone_map, prons, sil=sil)
+
+
+def load_pronunciation_lexicon(path: str, vocab=None, sil: str = "SIL") -> "Lexicon":
+    """
+    Build a Lexicon from a pronunciation dictionary file (e.g. the
+    LibriSpeech lexicon, OpenSLR SLR11: "WORD  P1 P2 P3" per line).
+
+    Stress digits on ARPAbet phones (AH0, EH1, ...) are stripped so AH0 and
+    AH1 share a phone, keeping the phone set small enough for a monophone toy.
+    Only the first pronunciation of each word is kept. If vocab is given, the
+    lexicon is restricted to those words.
+    """
+    vocab = set(w.lower() for w in vocab) if vocab is not None else None
+    prons: Dict[str, List[str]] = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            word = parts[0].lower()
+            if vocab is not None and word not in vocab:
+                continue
+            if word in prons:
+                continue  # keep first pronunciation only
+            phones = ["".join(c for c in p if not c.isdigit()) for p in parts[1:]]
+            prons[word] = phones
+    return Lexicon.from_prons(prons, sil=sil)
+
 
 # ---------------------------------------------------------------------------
 # Task: English digits (FSDD)
@@ -94,8 +130,54 @@ _YESNO_PRONS = {
 YESNO = Lexicon(_YESNO_PHONES, _YESNO_PRONS)
 
 
+# ---------------------------------------------------------------------------
+# Task: Google Speech Commands v0.02 (35 words, isolated word recognition)
+# ---------------------------------------------------------------------------
+# Pronunciations from CMUdict with stress markers stripped.
+
+_COMMANDS_PRONS = {
+    "yes":      ["Y", "EH", "S"],
+    "no":       ["N", "OW"],
+    "up":       ["AH", "P"],
+    "down":     ["D", "AW", "N"],
+    "left":     ["L", "EH", "F", "T"],
+    "right":    ["R", "AY", "T"],
+    "on":       ["AA", "N"],
+    "off":      ["AO", "F"],
+    "stop":     ["S", "T", "AA", "P"],
+    "go":       ["G", "OW"],
+    "zero":     ["Z", "IY", "R", "OW"],
+    "one":      ["W", "AH", "N"],
+    "two":      ["T", "UW"],
+    "three":    ["TH", "R", "IY"],
+    "four":     ["F", "AO", "R"],
+    "five":     ["F", "AY", "V"],
+    "six":      ["S", "IH", "K", "S"],
+    "seven":    ["S", "EH", "V", "AH", "N"],
+    "eight":    ["EY", "T"],
+    "nine":     ["N", "AY", "N"],
+    "backward": ["B", "AE", "K", "W", "ER", "D"],
+    "bed":      ["B", "EH", "D"],
+    "bird":     ["B", "ER", "D"],
+    "cat":      ["K", "AE", "T"],
+    "dog":      ["D", "AO", "G"],
+    "follow":   ["F", "AA", "L", "OW"],
+    "forward":  ["F", "AO", "R", "W", "ER", "D"],
+    "happy":    ["HH", "AE", "P", "IY"],
+    "house":    ["HH", "AW", "S"],
+    "learn":    ["L", "ER", "N"],
+    "marvin":   ["M", "AA", "R", "V", "IH", "N"],
+    "sheila":   ["SH", "IY", "L", "AH"],
+    "tree":     ["T", "R", "IY"],
+    "visual":   ["V", "IH", "ZH", "AH", "W", "AH", "L"],
+    "wow":      ["W", "AW"],
+}
+
+SPEECH_COMMANDS = Lexicon.from_prons(_COMMANDS_PRONS)
+
+
 if __name__ == "__main__":
-    for name, lex in [("DIGITS", DIGITS), ("YESNO", YESNO)]:
+    for name, lex in [("DIGITS", DIGITS), ("YESNO", YESNO), ("SPEECH_COMMANDS", SPEECH_COMMANDS)]:
         print(f"{name}: {lex}")
         for word in lex.words:
             phones = [lex.phone_ids[p] for p in lex.lexicon[word]]

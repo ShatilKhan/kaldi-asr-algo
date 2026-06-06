@@ -115,13 +115,19 @@ def mel_filterbank(
     n_mels: int = N_MELS,
     sample_rate: int = SAMPLE_RATE,
     low_freq: float = LOW_FREQ,
-    high_freq: float = HIGH_FREQ,
+    high_freq: float = None,
 ) -> np.ndarray:
     """
     Build a Mel filterbank matrix.
     Returns (n_mels, n_fft // 2 + 1) array.
     Each row is a triangular filter on the Mel scale.
+
+    high_freq defaults to the actual Nyquist of sample_rate, so 16kHz audio
+    keeps its 4-8kHz band (fricatives) instead of inheriting the 8kHz
+    constant's 4kHz cutoff.
     """
+    if high_freq is None:
+        high_freq = sample_rate / 2.0
     low_mel = hertz_to_mel(low_freq)
     high_mel = hertz_to_mel(high_freq)
     mel_points = np.linspace(low_mel, high_mel, n_mels + 2)
